@@ -4,16 +4,19 @@ using ..DynCompiler
 using ..HotSwap
 using ..ExprCache
 using ..AutoTune
+using ..Debug
+using ..IpcBridge
 
 export JoovySession, session_compile, session_swap!, session_status,
-       session_eval, session_reset!
+       session_eval, session_reset!, session_hot_reload, session_connect_ide!
 
 mutable struct JoovySession
     registry::HotSwapRegistry
     compile_log::Vector{NamedTuple{(:name, :time_ns, :cached), Tuple{Symbol, UInt64, Bool}}}
+    ide_connected::Bool
     lock::ReentrantLock
 
-    JoovySession() = new(HotSwapRegistry(), [], ReentrantLock())
+    JoovySession() = new(HotSwapRegistry(), [], false, ReentrantLock())
 end
 
 function session_compile(session::JoovySession, code::String;
@@ -50,6 +53,19 @@ function session_eval(session::JoovySession, code::String; mod::Module=Main)
     end
 end
 
+function session_hot_reload(session::JoovySession, file::String; mod::Module=Main)
+    joovy_hot_reload(file; registry=session.registry, mod=mod)
+end
+
+function session_connect_ide!(session::JoovySession)
+    if joovy_ipc_available()
+        joovy_register_ipc_handlers!()
+        session.ide_connected = true
+        return true
+    end
+    return false
+end
+
 function session_status(session::JoovySession)
     stats = compilation_stats()
     registry = session.registry
@@ -63,12 +79,20 @@ function session_status(session::JoovySession)
         copy(session.compile_log)
     end
 
+    source_maps = lock(DynCompiler._source_map_lock) do
+        Dict(k => (original=v.original_names, compiled=v.compiled_names,
+                    file=v.source_file, id=v.compile_id)
+             for (k, v) in GLOBAL_SOURCE_MAP)
+    end
+
     return (
         cache_hits=stats.content_hits,
         cache_misses=stats.content_misses,
         cache_entries=stats.total_entries,
         registered_functions=entries,
-        compile_log=log
+        source_maps=source_maps,
+        compile_log=log,
+        ide_connected=session.ide_connected
     )
 end
 
@@ -78,6 +102,9 @@ function session_reset!(session::JoovySession)
     end
     lock(session.registry.lock) do
         empty!(session.registry.entries)
+    end
+    lock(DynCompiler._source_map_lock) do
+        empty!(GLOBAL_SOURCE_MAP)
     end
 end
 

@@ -3,8 +3,9 @@ module DynCompiler
 using ..ExprCache
 using ..WorldAgeBridge
 
-export joovy_compile, joovy_compile_file, joovy_recompile!, CompiledUnit,
-       compilation_stats, GLOBAL_CACHE, JoovyCallable
+export joovy_compile, joovy_compile_file, joovy_recompile!,
+       compilation_stats, GLOBAL_CACHE, JoovyCallable,
+       GLOBAL_SOURCE_MAP, SourceMapping, source_map_lookup, source_map_reverse
 
 const GLOBAL_CACHE = JoovyCache()
 
@@ -16,6 +17,30 @@ end
 
 @inline function (jc::JoovyCallable)(args...; kwargs...)
     Base.invokelatest(jc.fn, args...; kwargs...)
+end
+
+struct SourceMapping
+    original_names::Vector{Symbol}
+    compiled_names::Vector{Symbol}
+    source_file::Union{String, Nothing}
+    source_code::String
+    compile_id::Int
+end
+
+const GLOBAL_SOURCE_MAP = Dict{Symbol, SourceMapping}()
+const _source_map_lock = ReentrantLock()
+
+function source_map_lookup(original_name::Symbol)
+    lock(_source_map_lock) do
+        get(GLOBAL_SOURCE_MAP, original_name, nothing)
+    end
+end
+
+function source_map_reverse(compiled_name::Symbol)
+    s = string(compiled_name)
+    m = match(r"^(.+)_joovy_\d+$", s)
+    m === nothing && return nothing
+    return Symbol(m.captures[1])
 end
 
 mutable struct CompiledUnit
@@ -37,12 +62,10 @@ function joovy_compile(code::String; name::Union{Symbol,Nothing}=nothing, mod::M
 
     t0 = time_ns()
     expr = Meta.parse("begin\n$code\nend")
-    compiled_fn = _compile_expr(mod, expr)
+    compiled_fn = _compile_expr(mod, expr, nothing)
     elapsed = time_ns() - t0
 
     h = cache_put!(GLOBAL_CACHE, code, compiled_fn)
-
-    unit = CompiledUnit(name, code, expr, compiled_fn, mod, elapsed, 0, h)
 
     if name !== nothing
         cache_register!(GLOBAL_CACHE, name, code)
@@ -58,7 +81,7 @@ function joovy_compile(expr::Expr; name::Union{Symbol,Nothing}=nothing, mod::Mod
     end
 
     t0 = time_ns()
-    compiled_fn = _compile_expr(mod, expr)
+    compiled_fn = _compile_expr(mod, expr, nothing)
     elapsed = time_ns() - t0
 
     h = cache_put!(GLOBAL_CACHE, expr, compiled_fn)
@@ -82,7 +105,7 @@ end
 function joovy_recompile!(name::Symbol, code::String; mod::Module=Main)
     t0 = time_ns()
     expr = Meta.parse("begin\n$code\nend")
-    compiled_fn = _compile_expr(mod, expr)
+    compiled_fn = _compile_expr(mod, expr, nothing)
     elapsed = time_ns() - t0
 
     h = cache_put!(GLOBAL_CACHE, code, compiled_fn)
@@ -93,7 +116,7 @@ end
 
 function joovy_recompile!(name::Symbol, expr::Expr; mod::Module=Main)
     t0 = time_ns()
-    compiled_fn = _compile_expr(mod, expr)
+    compiled_fn = _compile_expr(mod, expr, nothing)
     elapsed = time_ns() - t0
 
     h = cache_put!(GLOBAL_CACHE, expr, compiled_fn)
@@ -111,7 +134,7 @@ function _wrap_result(result)
     result isa Function ? JoovyCallable(result) : result
 end
 
-function _compile_expr(mod::Module, expr::Expr)
+function _compile_expr(mod::Module, expr::Expr, source_file::Union{String, Nothing})
     fnames = _extract_all_function_names(expr)
 
     if !isempty(fnames)
@@ -120,6 +143,15 @@ function _compile_expr(mod::Module, expr::Expr)
         expr = _rename_functions(expr, fnames, suffix)
         renamed = [Symbol("$(f)_joovy_$(suffix)") for f in fnames]
         Core.eval(mod, expr)
+
+        mapping = SourceMapping(fnames, renamed, source_file, string(expr), suffix)
+        lock(_source_map_lock) do
+            for (orig, comp) in zip(fnames, renamed)
+                GLOBAL_SOURCE_MAP[orig] = mapping
+                GLOBAL_SOURCE_MAP[comp] = mapping
+            end
+        end
+
         primary = renamed[1]
         return _wrap_fn(mod, primary)
     end

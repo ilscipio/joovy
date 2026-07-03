@@ -11,5 +11,6 @@ println("╚" * "═"^108 * "╝")
     include("test_hotswap.jl")
     include("test_scriptengine.jl")
     include("test_autotune.jl")
+    include("test_debug.jl")
     include("test_comparison.jl")
 end

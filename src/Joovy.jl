@@ -9,6 +9,8 @@ include("HotSwap.jl")
 include("JoovyObject.jl")
 include("ScriptEngine.jl")
 include("AutoTune.jl")
+include("Debug.jl")
+include("IpcBridge.jl")
 include("Integration.jl")
 
 using .ExprCache
@@ -18,6 +20,8 @@ using .HotSwap
 using .JoovyObjects
 using .ScriptEngine
 using .AutoTune
+using .Debug
+using .IpcBridge
 using .Integration
 
 # ExprCache
@@ -29,7 +33,8 @@ export joovy_eval, joovy_function, invoke_joovy
 
 # DynCompiler
 export joovy_compile, joovy_compile_file, joovy_recompile!,
-       compilation_stats, GLOBAL_CACHE, JoovyCallable
+       compilation_stats, GLOBAL_CACHE, JoovyCallable,
+       GLOBAL_SOURCE_MAP, SourceMapping, source_map_lookup, source_map_reverse
 
 # HotSwap
 export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
@@ -49,9 +54,16 @@ export TuneResult, TuneConfig, joovy_autotune, joovy_autotune_compare,
        Wisdom, wisdom_save, wisdom_load, wisdom_clear!,
        generate_variants, benchmark_variant
 
+# Debug
+export joovy_hot_reload, joovy_debug_info, is_joovy_frame, clean_frame_name,
+       joovy_filter_stacktrace, joovy_breakpoint_map
+
+# IpcBridge
+export joovy_register_ipc_handlers!, joovy_ipc_available
+
 # Integration
 export JoovySession, session_compile, session_swap!, session_status,
-       session_eval, session_reset!
+       session_eval, session_reset!, session_hot_reload, session_connect_ide!
 
 # Test/demo comparison table utilities
 export ComparisonTable, add_row!, print_table, table_all_passed
@@ -150,7 +162,8 @@ function print_table(table::ComparisonTable)
     println("-" ^ 110)
     passed = count(r -> r.match, table.rows)
     total = length(table.rows)
-    avg_ratio = total > 0 ? round(mean(r.speedup for r in table.rows if r.speedup > 0), digits=2) : 0.0
+    ratios = [r.speedup for r in table.rows if r.speedup > 0]
+    avg_ratio = !isempty(ratios) ? round(mean(ratios), digits=2) : 0.0
     println("  $passed/$total passed | Avg speed ratio: $(avg_ratio)x (>1 = native faster)")
     println("=" ^ 110)
     println()
