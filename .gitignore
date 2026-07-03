@@ -1,0 +1,11 @@
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+docs/build/
+docs/site/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

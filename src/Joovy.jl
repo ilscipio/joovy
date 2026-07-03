@@ -1,0 +1,173 @@
+module Joovy
+
+using Statistics: mean
+
+include("ExprCache.jl")
+include("WorldAgeBridge.jl")
+include("DynCompiler.jl")
+include("HotSwap.jl")
+include("JoovyObject.jl")
+include("ScriptEngine.jl")
+include("AutoTune.jl")
+
+using .ExprCache
+using .WorldAgeBridge
+using .DynCompiler
+using .HotSwap
+using .JoovyObjects
+using .ScriptEngine
+using .AutoTune
+
+# ExprCache
+export JoovyCache, cache_put!, cache_get, cache_has, cache_register!,
+       cache_lookup, cache_clear!, cache_stats, normalize_expr, expr_hash
+
+# WorldAgeBridge
+export joovy_eval, joovy_function, invoke_joovy
+
+# DynCompiler
+export joovy_compile, joovy_compile_file, joovy_recompile!,
+       compilation_stats, GLOBAL_CACHE, JoovyCallable
+
+# HotSwap
+export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
+       hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_version,
+       hotswap_history, GLOBAL_REGISTRY
+
+# JoovyObject
+export JoovyObject, joovy_override!, joovy_remove_override!, joovy_call,
+       joovy_has_override, joovy_list_overrides, joovy_reset!
+
+# ScriptEngine
+export JoovyEngine, joovy_run, joovy_run_file, joovy_watch!, joovy_unwatch!,
+       EngineResult
+
+# AutoTune
+export TuneResult, TuneConfig, joovy_autotune, joovy_autotune_compare,
+       Wisdom, wisdom_save, wisdom_load, wisdom_clear!,
+       generate_variants, benchmark_variant
+
+# Test/demo comparison table utilities
+export ComparisonTable, add_row!, print_table, table_all_passed
+
+mutable struct ComparisonRow
+    test_name::String
+    native_result::String
+    joovy_result::String
+    match::Bool
+    native_time_ns::Float64
+    joovy_time_ns::Float64
+    speedup::Float64
+end
+
+mutable struct ComparisonTable
+    title::String
+    rows::Vector{ComparisonRow}
+
+    ComparisonTable(title::String) = new(title, ComparisonRow[])
+end
+
+function add_row!(table::ComparisonTable, test_name::String,
+                  native_result, joovy_result,
+                  native_time_ns::Real, joovy_time_ns::Real)
+    match = _results_match(native_result, joovy_result)
+    speedup = native_time_ns > 0 ? native_time_ns / joovy_time_ns : 0.0
+
+    push!(table.rows, ComparisonRow(
+        test_name,
+        _format_result(native_result),
+        _format_result(joovy_result),
+        match,
+        Float64(native_time_ns),
+        Float64(joovy_time_ns),
+        speedup
+    ))
+end
+
+function _results_match(a, b)
+    if a isa AbstractFloat && b isa AbstractFloat
+        return isapprox(a, b; atol=1e-10, rtol=1e-8)
+    elseif a isa AbstractArray && b isa AbstractArray
+        return length(a) == length(b) && all(isapprox.(a, b; atol=1e-10, rtol=1e-8))
+    else
+        return a == b
+    end
+end
+
+function _format_result(x)
+    s = string(x)
+    length(s) > 40 ? first(s, 37) * "..." : s
+end
+
+function _format_time(ns::Float64)
+    if ns < 1_000
+        return "$(round(ns, digits=1)) ns"
+    elseif ns < 1_000_000
+        return "$(round(ns/1_000, digits=1)) us"
+    elseif ns < 1_000_000_000
+        return "$(round(ns/1_000_000, digits=2)) ms"
+    else
+        return "$(round(ns/1_000_000_000, digits=3)) s"
+    end
+end
+
+function print_table(table::ComparisonTable)
+    println()
+    println("=" ^ 110)
+    println("  $(table.title)")
+    println("=" ^ 110)
+
+    header = rpad("Test", 30) *
+             rpad("Native Result", 18) *
+             rpad("Joovy Result", 18) *
+             rpad("Match", 8) *
+             rpad("Native Time", 14) *
+             rpad("Joovy Time", 14) *
+             "Ratio"
+    println(header)
+    println("-" ^ 110)
+
+    for row in table.rows
+        match_str = row.match ? "  OK" : " FAIL"
+        ratio_str = row.speedup > 0 ? "$(round(row.speedup, digits=2))x" : "N/A"
+
+        line = rpad(row.test_name, 30) *
+               rpad(row.native_result, 18) *
+               rpad(row.joovy_result, 18) *
+               rpad(match_str, 8) *
+               rpad(_format_time(row.native_time_ns), 14) *
+               rpad(_format_time(row.joovy_time_ns), 14) *
+               ratio_str
+        println(line)
+    end
+
+    println("-" ^ 110)
+    passed = count(r -> r.match, table.rows)
+    total = length(table.rows)
+    avg_ratio = total > 0 ? round(mean(r.speedup for r in table.rows if r.speedup > 0), digits=2) : 0.0
+    println("  $passed/$total passed | Avg speed ratio: $(avg_ratio)x (>1 = native faster)")
+    println("=" ^ 110)
+    println()
+end
+
+function table_all_passed(table::ComparisonTable)
+    all(r -> r.match, table.rows)
+end
+
+if ccall(:jl_generating_output, Cint, ()) == 1
+    let c = JoovyCache()
+        cache_put!(c, "x + 1", identity)
+        cache_get(c, "x + 1")
+        cache_get(c, :(x + 1))
+        cache_has(c, "x + 1")
+        expr_hash("x + 1")
+        expr_hash(:(x + 1))
+        normalize_expr(:(x + 1))
+        cache_clear!(c)
+    end
+    precompile(joovy_compile, (String,))
+    precompile(joovy_compile, (Expr,))
+    precompile(joovy_compile_file, (String,))
+end
+
+end # module
