@@ -9,6 +9,7 @@ include("HotSwap.jl")
 include("JoovyObject.jl")
 include("ScriptEngine.jl")
 include("AutoTune.jl")
+include("Integration.jl")
 
 using .ExprCache
 using .WorldAgeBridge
@@ -17,6 +18,7 @@ using .HotSwap
 using .JoovyObjects
 using .ScriptEngine
 using .AutoTune
+using .Integration
 
 # ExprCache
 export JoovyCache, cache_put!, cache_get, cache_has, cache_register!,
@@ -46,6 +48,10 @@ export JoovyEngine, joovy_run, joovy_run_file, joovy_watch!, joovy_unwatch!,
 export TuneResult, TuneConfig, joovy_autotune, joovy_autotune_compare,
        Wisdom, wisdom_save, wisdom_load, wisdom_clear!,
        generate_variants, benchmark_variant
+
+# Integration
+export JoovySession, session_compile, session_swap!, session_status,
+       session_eval, session_reset!
 
 # Test/demo comparison table utilities
 export ComparisonTable, add_row!, print_table, table_all_passed

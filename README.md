@@ -13,6 +13,7 @@ The name is a portmanteau of **J**ulia + Gr**oovy**.
 - **Per-object method overrides** similar to Groovy's ExpandoMetaClass
 - **Script engine** with variable bindings and error capture
 - **Auto-tuning** that generates parametric code variants, benchmarks them, and picks the fastest
+- **Integration API** for embedding Joovy into IDEs and tools
 
 ## Installation
 
@@ -107,6 +108,33 @@ result.speedup_vs_first      # speedup over the slowest variant
 
 Joovy generates all combinations, benchmarks each one, and returns the winner. Wisdom (cached results) can be saved to disk and reloaded across sessions.
 
+## Embedding Joovy in tools
+
+The `JoovySession` API is designed for IDE plugins and external tools that manage a Julia process. It wraps compilation, hot-swapping, and status queries behind a single session object.
+
+```julia
+using Joovy
+
+session = JoovySession()
+
+# Compile and track
+fn = session_compile(session, "f(x) = x^2 + 1"; name=:f)
+fn(5)  # 26
+
+# Eval arbitrary code
+result = session_eval(session, "1 + 2 + 3")
+result.value  # 6
+
+# Inspect session state
+status = session_status(session)
+status.cache_hits
+status.cache_entries
+status.registered_functions
+status.compile_log
+```
+
+This is the primary interface for integrating Joovy with the [Flexible Julia](https://plugins.jetbrains.com/plugin/25635-flexible-julia) IDE plugin. The IDE sends code strings over IPC, Joovy compiles and caches them, and the session tracks everything for status reporting back to the IDE.
+
 ## Architecture
 
 Joovy is organized into independent modules with a clear dependency graph:
@@ -115,12 +143,16 @@ Joovy is organized into independent modules with a clear dependency graph:
 ExprCache          WorldAgeBridge
     |                    |
     +--- DynCompiler ----+
-    |        |
-    |    ScriptEngine
-    |
-    +--- HotSwap
-    |
-    +--- AutoTune
+    |        |           |
+    |    ScriptEngine    |
+    |                    |
+    +--- HotSwap         |
+    |                    |
+    +--- AutoTune        |
+    |                    |
+    +--- Integration ----+
+              |
+         JoovySession
 
 JoovyObjects (standalone)
 ```
@@ -138,6 +170,8 @@ JoovyObjects (standalone)
 **ScriptEngine** offers a managed execution environment with variable bindings and file watching.
 
 **AutoTune** generates parametric code variants from a template, benchmarks them, and selects the fastest. Supports a wisdom cache for persisting results.
+
+**Integration** provides the `JoovySession` facade for external tools and IDE plugins.
 
 ## Performance
 
