@@ -61,6 +61,16 @@ Pkg.add(url="https://github.com/ilscipio/joovy.git")
 - Julia 1.9 or later
 - Standard library only (SHA, Statistics, Serialization)
 
+## Benchmark
+
+Run the benchmark to see how Joovy affects compile and execution times in your environment:
+
+```julia
+include("examples/joovy_benchmark.jl")
+```
+
+It runs a set of functions twice (first call = compile cost, second call = runtime cost) and prints a comparison table. Run once with Joovy enabled, restart the REPL with Joovy disabled, and compare the first-call totals.
+
 ## Running tests
 
 ```julia
