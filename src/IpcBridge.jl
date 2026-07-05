@@ -4,10 +4,16 @@ using ..DynCompiler
 using ..HotSwap
 using ..ExprCache
 using ..Debug
+using ..LazyModules
+using ..CompileTimeline
+using ..PackageTier
 
 export joovy_register_ipc_handlers!, joovy_ipc_available
 
 const _ipc_registered = Ref{Bool}(false)
+
+const _lazy_modules = Dict{String, LazyModule}()
+const _lazy_modules_lock = ReentrantLock()
 
 function joovy_ipc_available()
     isdefined(Main, :FlexibleIPC) &&
@@ -20,33 +26,11 @@ function joovy_register_ipc_handlers!()
 
     ipc = Main.FlexibleIPC
 
-    ipc.register_handler("joovy/compile", function(params)
-        return Base.invokelatest(_handle_compile, params)
-    end)
-
-    ipc.register_handler("joovy/swap", function(params)
-        return Base.invokelatest(_handle_swap, params)
-    end)
-
-    ipc.register_handler("joovy/reload", function(params)
-        return Base.invokelatest(_handle_reload, params)
-    end)
-
-    ipc.register_handler("joovy/status", function(params)
-        return Base.invokelatest(_handle_status, params)
-    end)
-
-    ipc.register_handler("joovy/source_map", function(params)
-        return Base.invokelatest(_handle_source_map, params)
-    end)
-
-    ipc.register_handler("joovy/breakpoint_map", function(params)
-        return Base.invokelatest(_handle_breakpoint_map, params)
-    end)
-
-    ipc.register_handler("joovy/debug_info", function(params)
-        return Base.invokelatest(_handle_debug_info, params)
-    end)
+    for (route, handler) in _ipc_handler_table()
+        ipc.register_handler("joovy/$route", function(params)
+            return Base.invokelatest(handler, params)
+        end)
+    end
 
     _ipc_registered[] = true
     _notify("joovy/ready", Dict("version" => "0.1.0"))
@@ -123,23 +107,45 @@ function _handle_reload(params)
     file = get(params, "file", "")
     isempty(file) && return Dict("error" => "Missing file parameter")
 
+    abs_path = abspath(file)
     t0 = time_ns()
     try
-        result = joovy_hot_reload(file)
-        elapsed = time_ns() - t0
-        resp = Dict(
-            "status" => result.status,
-            "file" => file,
-            "reloaded" => [string(n) for n in result.reloaded],
-            "unchanged" => [string(n) for n in result.unchanged],
-            "fallback_definitions" => result.fallback_definitions,
-            "time_ns" => elapsed
-        )
-        if result.error !== nothing
-            resp["error"] = result.error
+        lm = lock(_lazy_modules_lock) do
+            get(_lazy_modules, abs_path, nothing)
         end
-        _notify("joovy/swap_status", resp)
-        return resp
+
+        if lm !== nothing
+            result = joovy_reload!(lm)
+            elapsed = time_ns() - t0
+            resp = Dict(
+                "status" => "ok",
+                "file" => file,
+                "mode" => "lazy_incremental",
+                "changed" => [string(n) for n in result.changed],
+                "removed" => [string(n) for n in result.removed],
+                "added" => [string(n) for n in result.added],
+                "time_ns" => elapsed
+            )
+            _notify("joovy/swap_status", resp)
+            return resp
+        else
+            result = joovy_hot_reload(file)
+            elapsed = time_ns() - t0
+            resp = Dict(
+                "status" => result.status,
+                "file" => file,
+                "mode" => "full_reload",
+                "reloaded" => [string(n) for n in result.reloaded],
+                "unchanged" => [string(n) for n in result.unchanged],
+                "fallback_definitions" => result.fallback_definitions,
+                "time_ns" => elapsed
+            )
+            if result.error !== nothing
+                resp["error"] = result.error
+            end
+            _notify("joovy/swap_status", resp)
+            return resp
+        end
     catch e
         elapsed = time_ns() - t0
         err = Dict("status" => "error", "error" => sprint(showerror, e),
@@ -238,6 +244,150 @@ function _handle_debug_info(params)
         "source_file" => info.source_file !== nothing ? info.source_file : "",
         "compile_id" => info.compile_id
     )
+end
+
+function _handle_use(params)
+    path = get(params, "path", "")
+    isempty(path) && return Dict("error" => "Missing path parameter")
+    tier = get(params, "tier", 1)
+
+    t0 = time_ns()
+    try
+        lm = joovy_use(path; tier=tier)
+        lock(_lazy_modules_lock) do
+            _lazy_modules[abspath(path)] = lm
+        end
+        elapsed = time_ns() - t0
+        status = lazy_status(lm)
+        return Dict(
+            "status" => "ok",
+            "path" => abspath(path),
+            "total_definitions" => status.total_definitions,
+            "compiled_count" => status.compiled_count,
+            "pending_count" => length(status.pending),
+            "time_ns" => elapsed
+        )
+    catch e
+        elapsed = time_ns() - t0
+        return Dict("status" => "error", "error" => sprint(showerror, e),
+                     "path" => path, "time_ns" => elapsed)
+    end
+end
+
+function _handle_lazy_status(params)
+    modules = Dict[]
+    lock(_lazy_modules_lock) do
+        for (path, lm) in _lazy_modules
+            try
+                s = lazy_status(lm)
+                push!(modules, Dict(
+                    "path" => s.path,
+                    "total" => s.total_definitions,
+                    "compiled" => s.compiled_count,
+                    "pending" => length(s.pending),
+                    "tiers" => Dict(string(k) => v for (k, v) in s.tiers),
+                    "call_counts" => Dict(string(k) => v for (k, v) in s.call_counts)
+                ))
+            catch
+            end
+        end
+    end
+    return Dict("modules" => modules)
+end
+
+function _handle_timeline(params)
+    report = compile_report()
+    return Dict("report" => report)
+end
+
+function _handle_dev_mode(params)
+    active = get(params, "active", true)
+    tier = get(params, "tier", 1)
+
+    t0 = time_ns()
+    try
+        result = joovy_dev_mode!(; tier=tier, active=active)
+        elapsed = time_ns() - t0
+        status = joovy_dev_mode_status()
+        resp = Dict(
+            "status" => "ok",
+            "active" => status.active,
+            "tier" => status.tier,
+            "packages" => Dict(string(k) => v for (k, v) in status.packages),
+            "time_ns" => elapsed
+        )
+        _notify("joovy/dev_mode_status", resp)
+        return resp
+    catch e
+        elapsed = time_ns() - t0
+        return Dict("status" => "error", "error" => sprint(showerror, e),
+                     "time_ns" => elapsed)
+    end
+end
+
+function _handle_package_tier(params)
+    pkg_str = get(params, "package", "")
+    isempty(pkg_str) && return Dict("error" => "Missing package parameter")
+    tier = get(params, "tier", 1)
+    pkg = Symbol(pkg_str)
+
+    t0 = time_ns()
+    try
+        result = joovy_use_package(pkg; tier=tier)
+        elapsed = time_ns() - t0
+        return Dict(
+            "status" => "ok",
+            "package" => pkg_str,
+            "tier" => tier,
+            "modules_configured" => result.modules_configured,
+            "time_ns" => elapsed
+        )
+    catch e
+        elapsed = time_ns() - t0
+        return Dict("status" => "error", "error" => sprint(showerror, e),
+                     "package" => pkg_str, "time_ns" => elapsed)
+    end
+end
+
+function _handle_promote_all(params)
+    tier = get(params, "tier", 2)
+
+    t0 = time_ns()
+    try
+        tiers = joovy_package_tiers()
+        for (pkg, _) in tiers
+            joovy_promote_package!(pkg; tier=tier)
+        end
+        elapsed = time_ns() - t0
+        return Dict(
+            "status" => "ok",
+            "tier" => tier,
+            "packages_promoted" => length(tiers),
+            "time_ns" => elapsed
+        )
+    catch e
+        elapsed = time_ns() - t0
+        return Dict("status" => "error", "error" => sprint(showerror, e),
+                     "time_ns" => elapsed)
+    end
+end
+
+function _ipc_handler_table()
+    [
+        ("compile", _handle_compile),
+        ("swap", _handle_swap),
+        ("reload", _handle_reload),
+        ("status", _handle_status),
+        ("source_map", _handle_source_map),
+        ("breakpoint_map", _handle_breakpoint_map),
+        ("debug_info", _handle_debug_info),
+        ("use", _handle_use),
+        ("lazy_status", _handle_lazy_status),
+        ("timeline", _handle_timeline),
+        ("dev_mode", _handle_dev_mode),
+        ("package_tier", _handle_package_tier),
+        ("promote_all", _handle_promote_all),
+    ]
 end
 
 end # module

@@ -1,7 +1,5 @@
 module ExprCache
 
-using SHA
-
 export JoovyCache, cache_put!, cache_get, cache_has, cache_register!,
        cache_lookup, cache_clear!, cache_stats, normalize_expr, expr_hash
 
@@ -62,11 +60,11 @@ end
 
 function expr_hash(expr)
     normalized = normalize_expr(expr)
-    bytes2hex(sha1(string(normalized)))
+    string(hash(string(normalized)); base=16)
 end
 
 function expr_hash(s::String)
-    bytes2hex(sha1(s))
+    string(hash(s); base=16)
 end
 
 function cache_put!(cache::JoovyCache, code::String, compiled)

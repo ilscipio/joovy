@@ -4,14 +4,17 @@ using ..ExprCache
 using ..WorldAgeBridge
 
 export joovy_compile, joovy_compile_file, joovy_recompile!,
-       compilation_stats, GLOBAL_CACHE, JoovyCallable,
-       GLOBAL_SOURCE_MAP, SourceMapping, source_map_lookup, source_map_reverse
+       compilation_stats, GLOBAL_CACHE, AbstractJoovyCallable, JoovyCallable,
+       GLOBAL_SOURCE_MAP, SourceMapping, source_map_lookup, source_map_reverse,
+       compile_expr_raw, extract_function_names
 
 const GLOBAL_CACHE = JoovyCache()
 
 const _compile_counter = Ref{Int}(0)
 
-struct JoovyCallable
+abstract type AbstractJoovyCallable end
+
+struct JoovyCallable <: AbstractJoovyCallable
     fn::Any
 end
 
@@ -23,7 +26,7 @@ struct SourceMapping
     original_names::Vector{Symbol}
     compiled_names::Vector{Symbol}
     source_file::Union{String, Nothing}
-    source_code::String
+    source_code::Union{String, Nothing}
     compile_id::Int
 end
 
@@ -41,17 +44,6 @@ function source_map_reverse(compiled_name::Symbol)
     m = match(r"^(.+)_joovy_\d+$", s)
     m === nothing && return nothing
     return Symbol(m.captures[1])
-end
-
-mutable struct CompiledUnit
-    name::Union{Symbol, Nothing}
-    source::String
-    expr::Expr
-    compiled_fn::Any
-    mod::Module
-    compile_time_ns::UInt64
-    call_count::Int
-    hash::String
 end
 
 function joovy_compile(code::String; name::Union{Symbol,Nothing}=nothing, mod::Module=Main)
@@ -140,15 +132,16 @@ function _compile_expr(mod::Module, expr::Expr, source_file::Union{String, Nothi
     if !isempty(fnames)
         _compile_counter[] += 1
         suffix = _compile_counter[]
-        expr = _rename_functions(expr, fnames, suffix)
-        renamed = [Symbol("$(f)_joovy_$(suffix)") for f in fnames]
+        mapping = Dict{Symbol,Symbol}(n => Symbol(n, :_joovy_, suffix) for n in fnames)
+        expr = _replace_names(expr, mapping)
+        renamed = Symbol[mapping[f] for f in fnames]
         Core.eval(mod, expr)
 
-        mapping = SourceMapping(fnames, renamed, source_file, string(expr), suffix)
+        sm = SourceMapping(fnames, renamed, source_file, nothing, suffix)
         lock(_source_map_lock) do
             for (orig, comp) in zip(fnames, renamed)
-                GLOBAL_SOURCE_MAP[orig] = mapping
-                GLOBAL_SOURCE_MAP[comp] = mapping
+                GLOBAL_SOURCE_MAP[orig] = sm
+                GLOBAL_SOURCE_MAP[comp] = sm
             end
         end
 
@@ -160,22 +153,12 @@ function _compile_expr(mod::Module, expr::Expr, source_file::Union{String, Nothi
     return _wrap_result(result)
 end
 
-function _rename_functions(expr::Expr, original_names::Vector{Symbol}, suffix::Int)
-    mapping = Dict(n => Symbol("$(n)_joovy_$(suffix)") for n in original_names)
-    _replace_names(expr, mapping)
-end
-
 function _replace_names(expr::Expr, mapping::Dict{Symbol,Symbol})
-    new_args = []
-    for arg in expr.args
-        if arg isa Symbol && haskey(mapping, arg)
-            push!(new_args, mapping[arg])
-        elseif arg isa Expr
-            push!(new_args, _replace_names(arg, mapping))
-        else
-            push!(new_args, arg)
-        end
-    end
+    new_args = Any[
+        arg isa Symbol && haskey(mapping, arg) ? mapping[arg] :
+        arg isa Expr ? _replace_names(arg, mapping) : arg
+        for arg in expr.args
+    ]
     Expr(expr.head, new_args...)
 end
 
@@ -188,10 +171,10 @@ function _extract_all_function_names(expr::Expr)
 end
 
 function _walk_for_functions!(expr::Expr, names::Vector{Symbol})
-    if expr.head in (:function, :(=))
-        fname = _try_extract_fname(expr)
-        if fname !== nothing
-            push!(names, fname)
+    if (expr.head === :function || expr.head === :(=)) && length(expr.args) >= 1
+        lhs = expr.args[1]
+        if lhs isa Expr && lhs.head === :call && length(lhs.args) >= 1 && lhs.args[1] isa Symbol
+            push!(names, lhs.args[1]::Symbol)
         end
     end
     for arg in expr.args
@@ -201,19 +184,13 @@ function _walk_for_functions!(expr::Expr, names::Vector{Symbol})
     end
 end
 
-function _try_extract_fname(expr::Expr)
-    if expr.head === :function || expr.head === :(=)
-        lhs = expr.args[1]
-        if lhs isa Expr && lhs.head === :call
-            name = lhs.args[1]
-            return name isa Symbol ? name : nothing
-        end
-    end
-    return nothing
-end
-
 function compilation_stats()
     return cache_stats(GLOBAL_CACHE)
 end
+
+compile_expr_raw(mod::Module, expr::Expr, source_file::Union{String, Nothing}) =
+    _compile_expr(mod, expr, source_file)
+
+extract_function_names(expr::Expr) = _extract_all_function_names(expr)
 
 end # module

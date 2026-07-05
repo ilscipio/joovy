@@ -2,13 +2,21 @@ module Integration
 
 using ..DynCompiler
 using ..HotSwap
+using ..StaticCompile
+using ..CompileTimeline
+using ..TieredCompile
+using ..MemoryManager
+using ..LazyModules
+using ..PackageTier
 using ..ExprCache
 using ..AutoTune
 using ..Debug
 using ..IpcBridge
 
 export JoovySession, session_compile, session_swap!, session_status,
-       session_eval, session_reset!, session_hot_reload, session_connect_ide!
+       session_eval, session_reset!, session_hot_reload, session_connect_ide!,
+       session_lock!, session_unlock!, session_callsite,
+       session_compile_tiered, session_use, session_compile_timeline
 
 mutable struct JoovySession
     registry::HotSwapRegistry
@@ -106,6 +114,42 @@ function session_reset!(session::JoovySession)
     lock(DynCompiler._source_map_lock) do
         empty!(GLOBAL_SOURCE_MAP)
     end
+end
+
+function session_lock!(session::JoovySession, name::Symbol; mod::Module=Main)
+    joovy_lock!(name; mod=mod)
+end
+
+function session_unlock!(session::JoovySession, name::Symbol)
+    joovy_unlock!(name)
+end
+
+function session_callsite(session::JoovySession, name::Symbol)
+    joovy_callsite(name; registry=session.registry)
+end
+
+function session_compile_tiered(session::JoovySession, code::String;
+                                name::Union{Symbol,Nothing}=nothing,
+                                tier::Int=1, mod::Module=Main)
+    t0 = time_ns()
+    result = joovy_compile_tiered(code; tier=tier, name=name, mod=mod)
+    elapsed = time_ns() - t0
+
+    if name !== nothing
+        lock(session.lock) do
+            push!(session.compile_log, (name=name, time_ns=elapsed, cached=false))
+        end
+    end
+    return result
+end
+
+function session_use(session::JoovySession, path::String;
+                     tier::Int=1, mod::Module=Main)
+    joovy_use(path; mod=mod, tier=tier)
+end
+
+function session_compile_timeline(session::JoovySession)
+    compile_timeline()
 end
 
 end # module

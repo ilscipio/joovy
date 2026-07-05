@@ -6,6 +6,12 @@ include("ExprCache.jl")
 include("WorldAgeBridge.jl")
 include("DynCompiler.jl")
 include("HotSwap.jl")
+include("StaticCompile.jl")
+include("CompileTimeline.jl")
+include("TieredCompile.jl")
+include("MemoryManager.jl")
+include("LazyModule.jl")
+include("PackageTier.jl")
 include("JoovyObject.jl")
 include("ScriptEngine.jl")
 include("AutoTune.jl")
@@ -17,6 +23,12 @@ using .ExprCache
 using .WorldAgeBridge
 using .DynCompiler
 using .HotSwap
+using .StaticCompile
+using .CompileTimeline
+using .TieredCompile
+using .MemoryManager
+using .LazyModules
+using .PackageTier
 using .JoovyObjects
 using .ScriptEngine
 using .AutoTune
@@ -33,13 +45,40 @@ export joovy_eval, joovy_function, invoke_joovy
 
 # DynCompiler
 export joovy_compile, joovy_compile_file, joovy_recompile!,
-       compilation_stats, GLOBAL_CACHE, JoovyCallable,
-       GLOBAL_SOURCE_MAP, SourceMapping, source_map_lookup, source_map_reverse
+       compilation_stats, GLOBAL_CACHE, AbstractJoovyCallable, JoovyCallable,
+       GLOBAL_SOURCE_MAP, SourceMapping, source_map_lookup, source_map_reverse,
+       compile_expr_raw, extract_function_names
 
 # HotSwap
 export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
        hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_version,
        hotswap_history, GLOBAL_REGISTRY
+
+# StaticCompile
+export TypedJoovyCallable, FullyTypedJoovyCallable,
+       JoovyCallSite, joovy_lock!, joovy_unlock!, joovy_is_locked,
+       joovy_callsite, joovy_compile_typed
+
+# CompileTimeline
+export CompileEvent, record_compile!, compile_timeline, compile_tree,
+       compile_stats_summary, compile_report, clear_timeline!
+
+# TieredCompile
+export TieredCallable, joovy_compile_tiered, promote!, get_tier,
+       set_promote_threshold!, tier_stats, set_module_tier!,
+       make_tiered_callable
+
+# MemoryManager
+export cache_trim!, hotswap_trim_history!, source_map_gc!, joovy_memory_stats,
+       timeline_trim!
+
+# LazyModule
+export LazyModule, joovy_use, joovy_reload!, joovy_watch_lazy!, joovy_promote_lazy!,
+       lazy_status, lazy_compiled, lazy_pending
+
+# PackageTier
+export joovy_use_package, joovy_promote_package!, joovy_dev_mode!,
+       joovy_dev_mode_status, joovy_package_tiers
 
 # JoovyObject
 export JoovyObject, joovy_override!, joovy_remove_override!, joovy_call,
@@ -63,7 +102,9 @@ export joovy_register_ipc_handlers!, joovy_ipc_available
 
 # Integration
 export JoovySession, session_compile, session_swap!, session_status,
-       session_eval, session_reset!, session_hot_reload, session_connect_ide!
+       session_eval, session_reset!, session_hot_reload, session_connect_ide!,
+       session_lock!, session_unlock!, session_callsite,
+       session_compile_tiered, session_use, session_compile_timeline
 
 # Test/demo comparison table utilities
 export ComparisonTable, add_row!, print_table, table_all_passed
@@ -174,19 +215,21 @@ function table_all_passed(table::ComparisonTable)
 end
 
 if ccall(:jl_generating_output, Cint, ()) == 1
-    let c = JoovyCache()
-        cache_put!(c, "x + 1", identity)
-        cache_get(c, "x + 1")
-        cache_get(c, :(x + 1))
-        cache_has(c, "x + 1")
-        expr_hash("x + 1")
-        expr_hash(:(x + 1))
-        normalize_expr(:(x + 1))
-        cache_clear!(c)
+    let _m = @__MODULE__
+        _fn = joovy_compile("_pc_f(x, y) = x + y"; name=:_pc_f, mod=_m)
+        Base.invokelatest(_fn, 1, 2)
+        joovy_recompile!(:_pc_f, "_pc_f(x, y) = x * y"; mod=_m)
+        source_map_lookup(:_pc_f)
+        source_map_reverse(:_pc_f_joovy_1)
+        joovy_compile_typed("_pc_t(x) = x^2"; returns=Int, mod=_m)
+        joovy_memory_stats()
+
+        cache_clear!(GLOBAL_CACHE)
+        lock(DynCompiler._source_map_lock) do
+            empty!(GLOBAL_SOURCE_MAP)
+        end
+        DynCompiler._compile_counter[] = 0
     end
-    precompile(joovy_compile, (String,))
-    precompile(joovy_compile, (Expr,))
-    precompile(joovy_compile_file, (String,))
 end
 
 end # module

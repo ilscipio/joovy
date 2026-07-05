@@ -7,6 +7,17 @@ export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
        hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_version,
        hotswap_history, GLOBAL_REGISTRY
 
+const _swap_guard_hooks = Function[]
+const _swap_guard_hooks_lock = ReentrantLock()
+
+function _check_swap_guards(name::Symbol)
+    lock(_swap_guard_hooks_lock) do
+        for hook in _swap_guard_hooks
+            hook(name)
+        end
+    end
+end
+
 mutable struct SwapEntry
     name::Symbol
     current_fn::Any
@@ -53,6 +64,8 @@ end
 function hotswap_swap!(name::Symbol, new_code::String;
                        registry::HotSwapRegistry=GLOBAL_REGISTRY,
                        mod::Module=Main)
+    _check_swap_guards(name)
+
     entry = lock(registry.lock) do
         get(registry.entries, name, nothing)
     end
