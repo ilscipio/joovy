@@ -2,8 +2,10 @@ module AutoTune
 
 using ..ExprCache
 using ..DynCompiler
-using Statistics
 using Serialization
+
+_median(x) = (s = sort(x); n = length(s); isodd(n) ? s[(n+1)÷2] : (s[n÷2] + s[n÷2+1]) / 2)
+_std(x) = (m = sum(x)/length(x); sqrt(sum((xi - m)^2 for xi in x) / (length(x) - 1)))
 
 export TuneResult, TuneConfig, joovy_autotune, joovy_autotune_compare,
        Wisdom, wisdom_save, wisdom_load, wisdom_clear!,
@@ -62,10 +64,10 @@ function benchmark_variant(fn, args...; config::TuneConfig=TuneConfig())
     VariantResult(
         0,
         Dict{Symbol,Any}(),
-        median(ftimes),
+        _median(ftimes),
         minimum(ftimes),
         maximum(ftimes),
-        config.bench_runs > 1 ? std(ftimes) : 0.0,
+        config.bench_runs > 1 ? _std(ftimes) : 0.0,
         result
     )
 end
