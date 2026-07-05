@@ -10,9 +10,9 @@ The name is a portmanteau of **J**ulia + Gr**oovy**. Like Groovy gives Java a dy
 
 Joovy is a dynamic compilation engine that sits between you and Julia's native compiler. It compiles your code through the same pipeline Julia uses, but controls when and how aggressively things get optimized. Functions start fast at a low optimization tier and get promoted to native speed in the background once they are hot.
 
-## Why this is not Revise
+## How Joovy differs from Revise
 
-Revise watches your files and re-runs the same slow compilation every time you edit something. It does not make Julia faster. It just automates the reload. Joovy replaces how compilation works. When you open a file, we parse it but compile nothing. When you call a function, we compile it in 2-9ms instead of 18ms by using a lower optimization tier. If you keep calling it, we promote it to native speed in the background. Your external packages get the same treatment. The result is that your first interaction with any code is fast, and hot paths converge to native performance without you doing anything. Revise gives you the same slow Julia with automatic reloading. Joovy gives you a fast Julia that gets faster as you work.
+[Revise.jl](https://github.com/timholy/Revise.jl) is an excellent tool for automatic code reloading during development. Joovy solves a different problem: it controls *how* code is compiled — starting at a low optimization tier for fast first response, then promoting hot paths to native speed in the background. They are complementary.
 
 ## How it works
 
