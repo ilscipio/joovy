@@ -47,7 +47,7 @@ hotswap_call(:greet, "world")
 
 ## IDE integration
 
-Joovy is the backend for the [Flexible Julia](https://plugins.jetbrains.com/plugin/25635-flexible-julia) IDE plugin. The plugin communicates over IPC (JSON-RPC over TCP) and handles tiered compilation, lazy loading, dev mode, and hot-reload transparently. You write normal Julia. The IDE handles the rest.
+Joovy is the backend for the [Flexible Julia](https://plugins.jetbrains.com/plugin/29356-flexible-julia/) IDE plugin. The plugin communicates over IPC (JSON-RPC over TCP) and handles tiered compilation, lazy loading, dev mode, and hot-reload transparently. You write normal Julia. The IDE handles the rest.
 
 ## Installation
 

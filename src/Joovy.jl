@@ -1,6 +1,6 @@
 module Joovy
 
-using Statistics: mean
+_mean(x) = isempty(x) ? 0.0 : sum(x) / length(x)
 
 include("ExprCache.jl")
 include("WorldAgeBridge.jl")
@@ -204,7 +204,7 @@ function print_table(table::ComparisonTable)
     passed = count(r -> r.match, table.rows)
     total = length(table.rows)
     ratios = [r.speedup for r in table.rows if r.speedup > 0]
-    avg_ratio = !isempty(ratios) ? round(mean(ratios), digits=2) : 0.0
+    avg_ratio = !isempty(ratios) ? round(_mean(ratios), digits=2) : 0.0
     println("  $passed/$total passed | Avg speed ratio: $(avg_ratio)x (>1 = native faster)")
     println("=" ^ 110)
     println()
