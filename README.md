@@ -1,5 +1,7 @@
 # Joovy.jl
 
+[![Tests](https://github.com/ilscipio/joovy/actions/workflows/test.yml/badge.svg)](https://github.com/ilscipio/joovy/actions/workflows/test.yml)
+
 Groovy for Julia. Tiered compilation, lazy modules, and hot-swapping at runtime.
 
 The name is a portmanteau of **J**ulia + Gr**oovy**. Like Groovy gives Java a dynamic layer without leaving the JVM, Joovy gives Julia a dynamic layer without leaving the Julia runtime.
@@ -59,7 +61,7 @@ Pkg.add(url="https://github.com/ilscipio/joovy.git")
 ## Requirements
 
 - Julia 1.9 or later
-- Standard library only (SHA, Statistics, Serialization)
+- Standard library only (Serialization)
 
 ## Benchmark
 
