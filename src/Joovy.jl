@@ -12,6 +12,8 @@ include("TieredCompile.jl")
 include("MemoryManager.jl")
 include("LazyModule.jl")
 include("PackageTier.jl")
+include("ColdLoad.jl")
+include("Instrument.jl")
 include("JoovyObject.jl")
 include("ScriptEngine.jl")
 include("AutoTune.jl")
@@ -28,6 +30,8 @@ using .CompileTimeline
 using .TieredCompile
 using .MemoryManager
 using .LazyModules
+using .Instrument
+using .ColdLoad
 using .PackageTier
 using .JoovyObjects
 using .ScriptEngine
@@ -66,7 +70,7 @@ export CompileEvent, record_compile!, compile_timeline, compile_tree,
 # TieredCompile
 export TieredCallable, joovy_compile_tiered, promote!, get_tier,
        set_promote_threshold!, tier_stats, set_module_tier!,
-       make_tiered_callable
+       make_tiered_callable, set_nospecialize!, nospecialize_enabled
 
 # MemoryManager
 export cache_trim!, hotswap_trim_history!, source_map_gc!, joovy_memory_stats,
@@ -76,9 +80,16 @@ export cache_trim!, hotswap_trim_history!, source_map_gc!, joovy_memory_stats,
 export LazyModule, joovy_use, joovy_reload!, joovy_watch_lazy!, joovy_promote_lazy!,
        lazy_status, lazy_compiled, lazy_pending
 
+# Instrument
+export CounterEntry, joovy_exec, instrument_expr, counters_report,
+       start_counter_stream!, reset_counters!
+
+# ColdLoad
+export prepare_cold_load!, finish_cold_load!, cold_load_active
+
 # PackageTier
-export joovy_use_package, joovy_promote_package!, joovy_dev_mode!,
-       joovy_dev_mode_status, joovy_package_tiers
+export joovy_use_package, joovy_promote_package!, joovy_dev_mode!, joovy_dev_mode_eager!,
+       joovy_dev_mode_status, joovy_package_tiers, joovy_promote_loaded!
 
 # JoovyObject
 export JoovyObject, joovy_override!, joovy_remove_override!, joovy_call,

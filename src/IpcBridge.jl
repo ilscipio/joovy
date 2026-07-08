@@ -7,6 +7,7 @@ using ..Debug
 using ..LazyModules
 using ..CompileTimeline
 using ..PackageTier
+using ..Instrument
 
 export joovy_register_ipc_handlers!, joovy_ipc_available
 
@@ -372,9 +373,14 @@ function _handle_promote_all(params)
     end
 end
 
+function _handle_counters(params)
+    return counters_report()
+end
+
 function _ipc_handler_table()
     [
         ("compile", _handle_compile),
+        ("counters", _handle_counters),
         ("swap", _handle_swap),
         ("reload", _handle_reload),
         ("status", _handle_status),
