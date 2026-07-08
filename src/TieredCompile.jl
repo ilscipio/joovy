@@ -5,10 +5,20 @@ using ..CompileTimeline
 
 export TieredCallable, joovy_compile_tiered, promote!, get_tier,
        set_promote_threshold!, tier_stats, set_module_tier!,
-       make_tiered_callable
+       make_tiered_callable, set_nospecialize!, nospecialize_enabled
 
 const _tier_compile_lock = ReentrantLock()
 const _show_stats = Ref(get(ENV, "JULIA_IDE_JOOVY_STATS", "") == "1")
+
+# Lever: whether tier-1 injects @nospecialize on function arguments.
+# Default comes from the JULIA_IDE_JOOVY_NOSPECIALIZE env var (a "startup parameter"
+# you can pass when launching the IDE); toggle at runtime with set_nospecialize!.
+# @nospecialize collapses per-type specializations into one, which only helps a
+# function actually called with many different types — for type-stable code it
+# usually costs compile AND runtime with no benefit.
+const _USE_NOSPECIALIZE = Ref(get(ENV, "JULIA_IDE_JOOVY_NOSPECIALIZE", "false") in ("1", "true", "yes", "on"))
+set_nospecialize!(b::Bool) = (_USE_NOSPECIALIZE[] = b; b)
+nospecialize_enabled() = _USE_NOSPECIALIZE[]
 
 mutable struct TieredCallable <: AbstractJoovyCallable
     fn::Any
@@ -109,9 +119,9 @@ end
 
 function set_module_tier!(mod::Module, tier::Int)
     if tier == 0
-        Core.eval(mod, :(Base.Experimental.@compiler_options compile=min optimize=0))
+        Core.eval(mod, :(Base.Experimental.@compiler_options compile=min optimize=0 max_methods=1))
     elseif tier == 1
-        Core.eval(mod, :(Base.Experimental.@optlevel 0))
+        Core.eval(mod, :(Base.Experimental.@compiler_options optimize=0 max_methods=1))
     else
         Core.eval(mod, :(Base.Experimental.@optlevel 2))
     end
@@ -133,7 +143,7 @@ end
 
 function _compile_at_tier(mod::Module, expr::Expr, tier::Int)
     _with_tier(mod, tier) do
-        transformed = tier < 2 ? _add_nospecialize(expr) : expr
+        transformed = (tier < 2 && _USE_NOSPECIALIZE[]) ? _add_nospecialize(expr) : expr
         compile_expr_raw(mod, transformed, nothing)
     end
 end
@@ -155,7 +165,7 @@ end
 
 function compile_in_module!(mod::Module, expr::Expr, name::Symbol, tier::Int)
     _with_tier(mod, tier) do
-        transformed = tier < 2 ? _add_nospecialize(expr) : expr
+        transformed = (tier < 2 && _USE_NOSPECIALIZE[]) ? _add_nospecialize(expr) : expr
         Core.eval(mod, transformed)
     end
     return Base.invokelatest(getfield, mod, name)

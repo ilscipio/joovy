@@ -3,8 +3,8 @@ module PackageTier
 using ..CompileTimeline
 using ..TieredCompile
 
-export joovy_use_package, joovy_promote_package!, joovy_dev_mode!,
-       joovy_dev_mode_status, joovy_package_tiers
+export joovy_use_package, joovy_promote_package!, joovy_dev_mode!, joovy_dev_mode_eager!,
+       joovy_dev_mode_status, joovy_package_tiers, joovy_promote_loaded!
 
 mutable struct PackageTierState
     tier::Int
@@ -113,17 +113,19 @@ end
 function joovy_dev_mode!(; tier::Int=1, active::Bool=true)
     _dev_mode[] = active
     _dev_tier[] = tier
-
     if active && !_hook_installed[]
         _install_package_hook!()
     end
+    return (active=active, tier=tier)
+end
 
+function joovy_dev_mode_eager!(; tier::Int=1, active::Bool=true)
+    joovy_dev_mode!(; tier=tier, active=active)
     if active
         _apply_to_loaded_packages!(tier)
     else
         _apply_to_loaded_packages!(2)
     end
-
     return (active=active, tier=tier)
 end
 
@@ -138,6 +140,20 @@ function joovy_package_tiers()
     lock(_package_tiers_lock) do
         Dict(k => (tier=v.tier, modules=length(v.submodules)) for (k, v) in _package_tiers)
     end
+end
+
+function joovy_promote_loaded!(; tier::Int=2)
+    tiers = joovy_package_tiers()
+    promoted = Symbol[]
+    for (pkg, info) in tiers
+        info.tier < tier || continue
+        try
+            joovy_promote_package!(pkg; tier=tier)
+            push!(promoted, pkg)
+        catch
+        end
+    end
+    return promoted
 end
 
 # ===================================================================
@@ -180,8 +196,17 @@ end
 function _on_package_load(pkg_id)
     _dev_mode[] || return
     @async begin
-        sleep(0.1)
-        _apply_to_loaded_packages!(_dev_tier[])
+        sleep(0.01)
+        try
+            mod = Base.root_module(pkg_id)
+            name = nameof(mod)
+            name in _SKIP_PACKAGES && return
+            lock(_package_tiers_lock) do
+                haskey(_package_tiers, name) && return
+            end
+            joovy_use_package(name; tier=_dev_tier[])
+        catch
+        end
     end
 end
 
