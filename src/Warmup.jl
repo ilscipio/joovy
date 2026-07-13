@@ -9,7 +9,7 @@ module Warmup
 # project) is safe here -- it never leaks into the user's REPL or another
 # concurrent call.
 
-export joovy_warm, warmup_generate, warmup_build
+export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop
 
 # Pkg and SHA are loaded LAZILY at first use (they are declared in
 # Project.toml [deps], both stdlibs). A top-level `import Pkg` here would make
@@ -27,6 +27,10 @@ const _WARMUP_PKG_UUID = "7b1a2c3d-0000-4000-8000-1234567890ab"
 
 const _RECOMPILE_COMMENT_RE = r"\)\s*#\s*recompile\s*$"
 const _MODULE_REF_RE = r"[A-Za-z_][A-Za-z0-9_!]*(?=\.)"
+# `--trace-compile-timing` (Julia 1.12+) prefixes each line with a block
+# comment like `#=   12.3 ms =#`; non-greedy so nested `=#` (if any) isn't
+# over-consumed.
+const _TIMING_PREFIX_RE = r"^#=.*?=#\s*"
 
 # ===================================================================
 # joovy_warm: background depot-cache warming
@@ -170,17 +174,21 @@ end
 """
     _sanitize_trace_lines(lines) -> Vector{String}
 
-Filter raw trace-compile lines down to `precompile(...)` statements: strip
-trailing `) # recompile` comments (which would otherwise comment out the
-`; catch; end` wrapper and break the generated module), drop any statement
-that references `Main.` (not resolvable outside the user's session), and
-dedup while preserving first-seen order.
+Filter raw trace-compile lines down to `precompile(...)` statements: first
+strip a leading `#= ... =#` timing-comment block (as emitted by
+`--trace-compile-timing` on Julia 1.12+, e.g. `#=   12.3 ms =# precompile(...)`)
+plus surrounding whitespace, then strip trailing `) # recompile` comments
+(which would otherwise comment out the `; catch; end` wrapper and break the
+generated module), drop any statement that references `Main.` (not
+resolvable outside the user's session), and dedup while preserving
+first-seen order.
 """
 function _sanitize_trace_lines(lines::Vector{String})::Vector{String}
     seen = Set{String}()
     result = String[]
     for raw in lines
         line = strip(raw)
+        line = String(strip(replace(line, _TIMING_PREFIX_RE => ""; count=1)))
         startswith(line, "precompile(") || continue
         line = String(strip(replace(line, _RECOMPILE_COMMENT_RE => ")")))
         occursin("Main.", line) && continue
@@ -344,6 +352,116 @@ function _warmup_build_impl(Pkg::Module, SHA::Module, project::String, warmup_pk
     elapsed = round(time() - t0, digits=1)
     println("__JOOVY_WARMUP_PKG__ status=built elapsed=$elapsed")
     return true
+end
+
+# ===================================================================
+# warm_daemon_loop: persistent worker, avoids per-request Julia startup
+# ===================================================================
+
+"""
+    warm_daemon_loop(; input::IO=stdin, io::IO=stdout)
+
+Run a persistent command loop so an IDE doesn't pay Julia's ~2-4s startup
+cost on every warm/build request. The daemon is expected to be launched as a
+dedicated subprocess with `--project=<env>` pointing at the project whose
+depot cache should be warmed; `WARM` never activates a different project (it
+runs against the daemon's own already-active project), and `BUILD` always
+restores the daemon's original active project afterward.
+
+Loads Pkg and SHA once, prints
+
+    __JOOVY_DAEMON__ status=ready
+
+then reads TAB-separated commands (one per line, tabs never appear in paths
+or names) from `input` until EOF or an `EXIT` command:
+
+    WARM\\t<pkg1,pkg2,...>\\t<cancel_file_path_or_->
+    BUILD\\t<project_dir>\\t<trace_dir>
+    EXIT
+
+`WARM` reuses [`_joovy_warm_impl`](@ref) (with `project=nothing`, since the
+daemon's active project already IS the target project), printing the usual
+`__JOOVY_WARM__` / `__JOOVY_WARM_DONE__` markers. `BUILD` reuses
+[`warmup_generate`](@ref) then, if it returns a package dir,
+[`_warmup_build_impl`](@ref) -- both mutate the active project via
+`Pkg.activate`, so the project active before the command is captured and
+restored in a `finally`.
+
+After EVERY command (success, failure, or unknown) prints and flushes:
+
+    __JOOVY_DAEMON__ status=idle
+
+On error, a command additionally prints (before the idle marker):
+
+    __JOOVY_DAEMON_ERR__ <compact error message>
+
+A command failure never kills the loop -- only `EXIT` (which prints
+`__JOOVY_DAEMON__ status=exit` then returns) or the input stream reaching EOF
+ends it. On Julia < 1.10 prints `__JOOVY_DAEMON__ status=skip
+reason=julia_version` and returns immediately without entering the loop.
+"""
+function warm_daemon_loop(; input::IO=stdin, io::IO=stdout)
+    if VERSION < v"1.10"
+        println(io, "__JOOVY_DAEMON__ status=skip reason=julia_version")
+        return nothing
+    end
+
+    # Lazy Pkg/SHA + invokelatest for anything that touches them: see
+    # joovy_warm for the world-age rationale. Loaded once, up front, so every
+    # subsequent command dispatch skips Base.require's lookup cost.
+    Pkg = _pkg()
+    SHA = _sha()
+
+    println(io, "__JOOVY_DAEMON__ status=ready")
+    flush(io)
+
+    while !eof(input)
+        line = readline(input)
+        isempty(strip(line)) && continue
+
+        parts = split(line, '\t')
+        cmd = parts[1]
+
+        if cmd == "EXIT"
+            println(io, "__JOOVY_DAEMON__ status=exit")
+            flush(io)
+            break
+        end
+
+        try
+            if cmd == "WARM"
+                length(parts) >= 3 || error("WARM requires <packages>\\t<cancel_file>")
+                pkgs = filter(!isempty, String.(split(parts[2], ',')))
+                cancel_file = parts[3] == "-" ? nothing : String(parts[3])
+                Base.invokelatest(_joovy_warm_impl, Pkg, pkgs;
+                                  project=nothing,
+                                  ntasks=max(1, Sys.CPU_THREADS ÷ 2),
+                                  cancel_file=cancel_file, io=io)
+            elseif cmd == "BUILD"
+                length(parts) >= 3 || error("BUILD requires <project_dir>\\t<trace_dir>")
+                project_dir = String(parts[2])
+                trace_dir = String(parts[3])
+                saved = Base.active_project()
+                try
+                    pkg_dir = warmup_generate(project_dir, trace_dir)
+                    if pkg_dir !== nothing
+                        Base.invokelatest(_warmup_build_impl, Pkg, SHA, project_dir, pkg_dir)
+                    end
+                finally
+                    saved === nothing || Base.invokelatest(Pkg.activate, dirname(saved); io=devnull)
+                end
+            else
+                println(io, "__JOOVY_DAEMON_ERR__ unknown command: $cmd")
+            end
+        catch e
+            println(io, "__JOOVY_DAEMON_ERR__ $(_compact_error(e))")
+        end
+
+        println(io, "__JOOVY_DAEMON__ status=idle")
+        flush(io)
+    end
+
+    return nothing
 end
 
 # ===================================================================

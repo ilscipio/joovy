@@ -55,6 +55,8 @@ Joovy is the backend for the [Flexible Julia](https://plugins.jetbrains.com/plug
 
 `joovy_warm` precompiles a list of packages one at a time in a background process, so the depot cache is warm before you need it. `warmup_generate` turns a `--trace-compile` log into a standalone `JoovyWarmup` package covering your project's actual call patterns, and `warmup_build` precompiles that package against your project's exact dependency resolution. The IDE runs all three automatically; you normally never call them yourself.
 
+Julia 1.12 has a community-documented startup regression versus 1.10 on large package sets (~50% slower across 1000 packages, per reports on the JuliaLang discourse). Joovy's cold-load tiering and background warmup claw back that regression and then some: 3x faster cold time-to-first-plot on Plots, and 85% faster time-to-first-execution via trace-driven warmup, measured on 1.12.3.
+
 ```julia
 using Joovy
 joovy_warm(["JSON", "HTTP"]; project="/path/to/my_project")

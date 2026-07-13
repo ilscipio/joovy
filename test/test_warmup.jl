@@ -29,6 +29,28 @@ import SHA
     end
 
     # ---------------------------------------------------------------
+    # _sanitize_trace_lines: --trace-compile-timing (Julia 1.12+) prefixes
+    # ---------------------------------------------------------------
+    @testset "_sanitize_trace_lines timing prefixes" begin
+        lines = [
+            "#=   12.3 ms =# precompile(Tuple{typeof(Base.sum), Vector{Int64}})",
+            "#=    1.2 ms =# precompile(Tuple{typeof(Main.foo), Int64})",
+            "#=  100.0 ms =# precompile(Tuple{typeof(Base.sum), Vector{Int64}})   # recompile",
+        ]
+        sanitized = Joovy.Warmup._sanitize_trace_lines(lines)
+
+        # Timing-prefixed line is kept and normalized (prefix stripped).
+        @test "precompile(Tuple{typeof(Base.sum), Vector{Int64}})" in sanitized
+        # Timing-prefixed Main. line is still dropped.
+        @test !any(l -> occursin("Main.", l), sanitized)
+        # No leftover comment markers or dupes.
+        @test !any(l -> occursin("#=", l), sanitized)
+        @test !any(l -> occursin("# recompile", l), sanitized)
+        @test length(sanitized) == length(unique(sanitized))
+        @test sanitized == ["precompile(Tuple{typeof(Base.sum), Vector{Int64}})"]
+    end
+
+    # ---------------------------------------------------------------
     # _statement_modules
     # ---------------------------------------------------------------
     @testset "_statement_modules" begin
@@ -209,5 +231,97 @@ import SHA
         # No Project.toml at all.
         tmp3 = mktempdir()
         @test Joovy.Warmup._active_manifest_path(tmp3) === nothing
+    end
+
+    # ---------------------------------------------------------------
+    # warm_daemon_loop: in-process, using IOBuffer pipes against the CURRENT
+    # process env (Pkg is already loaded by the test runner, so world-age
+    # is a non-issue here; the subprocess test below additionally exercises
+    # the lazy-Pkg-load / invokelatest path).
+    # ---------------------------------------------------------------
+    @testset "warm_daemon_loop (in-process)" begin
+        input = IOBuffer("WARM\tNonExistentPkgXYZ\t-\nEXIT\n")
+        out = IOBuffer()
+        warm_daemon_loop(input=input, io=out)
+        output = String(take!(out))
+
+        @test occursin("__JOOVY_DAEMON__ status=ready", output)
+        @test occursin("__JOOVY_WARM__ pkg=NonExistentPkgXYZ status=skip reason=not_in_env", output)
+        @test occursin("__JOOVY_WARM_DONE__ total=1 warmed=0 failed=0", output)
+        @test occursin("__JOOVY_DAEMON__ status=idle", output)
+        @test occursin("__JOOVY_DAEMON__ status=exit", output)
+
+        # status=idle must follow the WARM markers and precede status=exit.
+        idle_pos = findfirst("__JOOVY_DAEMON__ status=idle", output)
+        exit_pos = findfirst("__JOOVY_DAEMON__ status=exit", output)
+        done_pos = findfirst("__JOOVY_WARM_DONE__", output)
+        @test first(done_pos) < first(idle_pos) < first(exit_pos)
+    end
+
+    @testset "warm_daemon_loop unknown/malformed commands" begin
+        input = IOBuffer("\nFOO\nWARM\tonly-two-parts\nEXIT\n")
+        out = IOBuffer()
+        warm_daemon_loop(input=input, io=out)
+        output = String(take!(out))
+
+        @test occursin("__JOOVY_DAEMON__ status=ready", output)
+        @test occursin("__JOOVY_DAEMON_ERR__ unknown command: FOO", output)
+        # Malformed WARM (missing cancel_file arg) errors but does not crash
+        # the loop -- an idle marker still follows, then EXIT still works.
+        @test occursin("__JOOVY_DAEMON_ERR__", output)
+        @test occursin("__JOOVY_DAEMON__ status=exit", output)
+        @test count("__JOOVY_DAEMON__ status=idle", output) == 2  # FOO, malformed WARM
+    end
+
+    @testset "warm_daemon_loop EOF without EXIT exits gracefully" begin
+        input = IOBuffer("WARM\tNonExistentPkgXYZ\t-\n")  # no trailing EXIT
+        out = IOBuffer()
+        warm_daemon_loop(input=input, io=out)
+        output = String(take!(out))
+
+        @test occursin("__JOOVY_DAEMON__ status=ready", output)
+        @test occursin("__JOOVY_DAEMON__ status=idle", output)
+        @test !occursin("__JOOVY_DAEMON__ status=exit", output)
+    end
+
+    # ---------------------------------------------------------------
+    # warm_daemon_loop: end-to-end via subprocess, exercising the lazy
+    # Pkg/SHA load + invokelatest dispatch path with a layered scratch depot
+    # (like the warmup_build e2e above). The daemon is launched against a
+    # separate EMPTY project env while Joovy itself is reached via LOAD_PATH
+    # -- mirroring how an IDE would spawn the daemon with `--project=<user
+    # env>` without making Joovy a declared dependency of that env.
+    # ---------------------------------------------------------------
+    if VERSION >= v"1.10"
+        @testset "warm_daemon_loop e2e (subprocess)" begin
+            joovy_root = dirname(@__DIR__)
+
+            tmp = mktempdir()
+            env_dir = joinpath(tmp, "empty_env")
+            mkpath(env_dir)
+            write(joinpath(env_dir, "Project.toml"), "")
+
+            scratch_depot = joinpath(tmp, "scratch_depot")
+            mkpath(scratch_depot)
+            depot_sep = Sys.iswindows() ? ";" : ":"
+            depot_env = scratch_depot * depot_sep * first(Base.DEPOT_PATH)
+
+            script = "push!(LOAD_PATH, raw\"$(joovy_root)\"); using Joovy; Joovy.warm_daemon_loop()"
+            cmd = `$(Base.julia_cmd()) --project=$(env_dir) --startup-file=no -e $(script)`
+            cmd = addenv(cmd, "JULIA_DEPOT_PATH" => depot_env)
+
+            proc = open(cmd, "r+")
+            write(proc, "WARM\tTest\t-\nEXIT\n")
+            closewrite(proc)  # signal EOF on the subprocess's stdin
+
+            output = read(proc, String)
+            wait(proc)
+
+            @test success(proc)
+            @test occursin("__JOOVY_DAEMON__ status=ready", output)
+            @test occursin("__JOOVY_WARM__ pkg=Test status=skip reason=not_in_env", output)
+            @test occursin("__JOOVY_DAEMON__ status=idle", output)
+            @test occursin("__JOOVY_DAEMON__ status=exit", output)
+        end
     end
 end

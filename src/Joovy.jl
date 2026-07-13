@@ -120,7 +120,7 @@ export JoovySession, session_compile, session_swap!, session_status,
        session_compile_tiered, session_use, session_compile_timeline
 
 # Warmup
-export joovy_warm, warmup_generate, warmup_build
+export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop
 
 # Test/demo comparison table utilities
 export ComparisonTable, add_row!, print_table, table_all_passed
