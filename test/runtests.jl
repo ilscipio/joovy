@@ -16,5 +16,6 @@ println("╚" * "═"^108 * "╝")
     include("test_compile_timeline.jl")
     include("test_tiered_compile.jl")
     include("test_lazy_module.jl")
+    include("test_warmup.jl")
     include("test_comparison.jl")
 end

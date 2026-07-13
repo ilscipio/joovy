@@ -20,6 +20,7 @@ include("AutoTune.jl")
 include("Debug.jl")
 include("IpcBridge.jl")
 include("Integration.jl")
+include("Warmup.jl")
 
 using .ExprCache
 using .WorldAgeBridge
@@ -39,6 +40,7 @@ using .AutoTune
 using .Debug
 using .IpcBridge
 using .Integration
+using .Warmup
 
 # ExprCache
 export JoovyCache, cache_put!, cache_get, cache_has, cache_register!,
@@ -116,6 +118,9 @@ export JoovySession, session_compile, session_swap!, session_status,
        session_eval, session_reset!, session_hot_reload, session_connect_ide!,
        session_lock!, session_unlock!, session_callsite,
        session_compile_tiered, session_use, session_compile_timeline
+
+# Warmup
+export joovy_warm, warmup_generate, warmup_build
 
 # Test/demo comparison table utilities
 export ComparisonTable, add_row!, print_table, table_all_passed

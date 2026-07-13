@@ -51,6 +51,18 @@ hotswap_call(:greet, "world")
 
 Joovy is the backend for the [Flexible Julia](https://plugins.jetbrains.com/plugin/29356-flexible-julia/) IDE plugin. The plugin communicates over IPC (JSON-RPC over TCP) and handles tiered compilation, lazy loading, dev mode, and hot-reload transparently. You write normal Julia. The IDE handles the rest.
 
+## Background warmup
+
+`joovy_warm` precompiles a list of packages one at a time in a background process, so the depot cache is warm before you need it. `warmup_generate` turns a `--trace-compile` log into a standalone `JoovyWarmup` package covering your project's actual call patterns, and `warmup_build` precompiles that package against your project's exact dependency resolution. The IDE runs all three automatically; you normally never call them yourself.
+
+```julia
+using Joovy
+joovy_warm(["JSON", "HTTP"]; project="/path/to/my_project")
+
+pkg_dir = warmup_generate("/path/to/my_project", "trace_output_dir")
+warmup_build("/path/to/my_project", pkg_dir)
+```
+
 ## Installation
 
 ```julia
@@ -61,7 +73,7 @@ Pkg.add(url="https://github.com/ilscipio/joovy.git")
 ## Requirements
 
 - Julia 1.9 or later
-- Standard library only (Serialization)
+- Standard library only (Serialization, Pkg, SHA)
 
 ## Benchmark
 
