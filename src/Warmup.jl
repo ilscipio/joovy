@@ -9,10 +9,17 @@ module Warmup
 # project) is safe here -- it never leaks into the user's REPL or another
 # concurrent call.
 
-import Pkg
-import SHA
-
 export joovy_warm, warmup_generate, warmup_build
+
+# Pkg and SHA are loaded LAZILY at first use (they are declared in
+# Project.toml [deps], both stdlibs). A top-level `import Pkg` here would make
+# Pkg a load-time dependency of Joovy and add ~0.6s to EVERY `using Joovy`
+# session start, even though only the dedicated warmup subprocesses ever call
+# these functions.
+const _PKG_ID = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
+const _SHA_ID = Base.PkgId(Base.UUID("ea8e919c-243c-51af-8825-aaa63cd721ce"), "SHA")
+_pkg() = Base.require(_PKG_ID)
+_sha() = Base.require(_SHA_ID)
 
 # Fixed UUID for the generated JoovyWarmup package. Keeping it constant lets
 # the IDE recognize/reuse a previously generated+built package across runs.
@@ -46,7 +53,19 @@ function joovy_warm(packages::Vector{String};
         println(io, "__JOOVY_WARM__ status=skip reason=julia_version")
         return false
     end
+    # Pkg is loaded lazily (see _pkg); invokelatest crosses the world-age
+    # boundary so the impl can call methods newer than Joovy's own compile.
+    Pkg = _pkg()
+    return Base.invokelatest(_joovy_warm_impl, Pkg, packages;
+                             project=project, ntasks=ntasks,
+                             cancel_file=cancel_file, io=io)
+end
 
+function _joovy_warm_impl(Pkg::Module, packages::Vector{String};
+                          project::Union{Nothing,String},
+                          ntasks::Integer,
+                          cancel_file::Union{Nothing,String},
+                          io::IO)
     ENV["JULIA_NUM_PRECOMPILE_TASKS"] = string(ntasks)
 
     project !== nothing && Pkg.activate(project; io=devnull)
@@ -71,7 +90,7 @@ function joovy_warm(packages::Vector{String};
 
         t0 = time()
         try
-            _pkg_precompile([pkg]; io=devnull)
+            _pkg_precompile(Pkg, [pkg]; io=devnull)
             elapsed = round(time() - t0, digits=1)
             println(io, "__JOOVY_WARM__ pkg=$pkg status=done elapsed=$elapsed")
             warmed += 1
@@ -126,8 +145,8 @@ function warmup_generate(project::String, trace_dir::String; name::String="Joovy
         return nothing
     end
 
-    Pkg.activate(project; io=devnull)
-    dep_uuids = Dict{String,Base.UUID}(info.name => uuid for (uuid, info) in Pkg.dependencies())
+    # Lazy Pkg + invokelatest: see joovy_warm for the world-age rationale.
+    dep_uuids = Base.invokelatest(_project_dep_uuids, _pkg(), project)
 
     referenced = Set{String}()
     for stmt in statements
@@ -291,6 +310,11 @@ function warmup_build(project::String, warmup_pkg_dir::String)
         return false
     end
 
+    # Lazy Pkg/SHA + invokelatest: see joovy_warm for the world-age rationale.
+    return Base.invokelatest(_warmup_build_impl, _pkg(), _sha(), project, warmup_pkg_dir)
+end
+
+function _warmup_build_impl(Pkg::Module, SHA::Module, project::String, warmup_pkg_dir::String)
     project_toml = joinpath(project, "Project.toml")
     manifest_path = _active_manifest_path(project)
     if !isfile(project_toml) || manifest_path === nothing
@@ -307,7 +331,7 @@ function warmup_build(project::String, warmup_pkg_dir::String)
     try
         Pkg.activate(build_env; io=devnull)
         Pkg.develop(path=warmup_pkg_dir; preserve=Pkg.PRESERVE_ALL, io=devnull)
-        _pkg_precompile("JoovyWarmup"; io=devnull)
+        _pkg_precompile(Pkg, "JoovyWarmup"; io=devnull)
     catch e
         println("__JOOVY_WARMUP_PKG__ status=fail")
         println("__JOOVY_WARMUP_ERR__ $(_compact_error(e))")
@@ -330,13 +354,18 @@ end
 # the io-less call if the keyword is rejected outright (a MethodError raised
 # before any actual precompilation runs), while letting real precompile
 # failures propagate to the caller's try/catch.
-function _pkg_precompile(target; io::IO=devnull)
+function _pkg_precompile(Pkg::Module, target; io::IO=devnull)
     try
         Pkg.precompile(target; io=io)
     catch e
         e isa MethodError || rethrow()
         Pkg.precompile(target)
     end
+end
+
+function _project_dep_uuids(Pkg::Module, project::String)
+    Pkg.activate(project; io=devnull)
+    return Dict{String,Base.UUID}(info.name => uuid for (uuid, info) in Pkg.dependencies())
 end
 
 _compact_error(e) = replace(sprint(showerror, e), '\n' => ' ')
