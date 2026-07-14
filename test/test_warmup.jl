@@ -238,7 +238,18 @@ import SHA
     # process env (Pkg is already loaded by the test runner, so world-age
     # is a non-issue here; the subprocess test below additionally exercises
     # the lazy-Pkg-load / invokelatest path).
+    # On Julia < 1.10 the daemon (like all Warmup entry points) skips by
+    # design, so only the skip marker is asserted there.
     # ---------------------------------------------------------------
+    if VERSION < v"1.10"
+        @testset "warm_daemon_loop skips on old Julia" begin
+            out = IOBuffer()
+            warm_daemon_loop(input=IOBuffer("EXIT\n"), io=out)
+            @test occursin("status=skip reason=julia_version", String(take!(out)))
+        end
+    end
+
+    if VERSION >= v"1.10"
     @testset "warm_daemon_loop (in-process)" begin
         input = IOBuffer("WARM\tNonExistentPkgXYZ\t-\nEXIT\n")
         out = IOBuffer()
@@ -283,6 +294,7 @@ import SHA
         @test occursin("__JOOVY_DAEMON__ status=idle", output)
         @test !occursin("__JOOVY_DAEMON__ status=exit", output)
     end
+    end # VERSION >= v"1.10" (in-process daemon testsets)
 
     # ---------------------------------------------------------------
     # warm_daemon_loop: end-to-end via subprocess, exercising the lazy
@@ -312,7 +324,9 @@ import SHA
 
             proc = open(cmd, "r+")
             write(proc, "WARM\tTest\t-\nEXIT\n")
-            closewrite(proc)  # signal EOF on the subprocess's stdin
+            # Signal EOF on the subprocess's stdin. NOT closewrite(proc): on
+            # Julia 1.10/Linux that throws ENOTSOCK for process pipes.
+            close(proc.in)
 
             output = read(proc, String)
             wait(proc)
