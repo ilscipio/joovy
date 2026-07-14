@@ -65,8 +65,18 @@ import SHA
     end
 
     # ---------------------------------------------------------------
-    # warmup_generate: structural test (temp project + synthetic trace file)
+    # warmup_generate: structural test (temp project + synthetic trace file).
+    # On Julia < 1.10 warmup_generate skips by design and returns nothing.
     # ---------------------------------------------------------------
+    if VERSION < v"1.10"
+        @testset "warmup_generate skips on old Julia" begin
+            tmp = mktempdir()
+            mkpath(joinpath(tmp, "traces"))
+            @test warmup_generate(tmp, joinpath(tmp, "traces")) === nothing
+        end
+    end
+
+    if VERSION >= v"1.10"
     @testset "warmup_generate structure" begin
         orig_project = Base.active_project()
 
@@ -119,6 +129,7 @@ import SHA
         has_error = any(a -> a isa Expr && a.head === :error, parsed.args)
         @test !has_error
     end
+    end # VERSION >= v"1.10" (warmup_generate structure)
 
     # ---------------------------------------------------------------
     # warmup_build: end-to-end via subprocess with a layered scratch depot
