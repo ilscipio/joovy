@@ -230,9 +230,12 @@ import SHA
 
         # Versioned manifest for the CURRENT running Julia takes priority over
         # the unversioned one, mirroring Julia's own loading resolution.
+        # Julia < 1.10.8 has no versioned-manifest support, so Manifest.toml
+        # remains the correct answer there.
         versioned_name = "Manifest-v$(VERSION.major).$(VERSION.minor).toml"
         write(joinpath(tmp, versioned_name), "julia_version = \"$(VERSION)\"\n")
-        @test Joovy.Warmup._active_manifest_path(tmp) == joinpath(tmp, versioned_name)
+        expected = VERSION >= v"1.10.8" ? versioned_name : "Manifest.toml"
+        @test Joovy.Warmup._active_manifest_path(tmp) == joinpath(tmp, expected)
 
         # Directory with a Project.toml but no manifest of any kind.
         tmp2 = mktempdir()
