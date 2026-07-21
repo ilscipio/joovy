@@ -18,6 +18,15 @@ const _dev_mode = Ref{Bool}(false)
 const _dev_tier = Ref{Int}(1)
 const _hook_installed = Ref{Bool}(false)
 
+# Set by the Config submodule to a function `name::Symbol -> Union{Int,Nothing}` that
+# returns a per-package tier override from LocalPreferences.toml (nothing = no override).
+const _config_pkg_tier_lookup = Ref{Any}(nothing)
+
+# Selective mode: only packages that have an explicit config tier are tiered on load;
+# everything else is left native. Enabled when the config has per-package keys but no
+# `default`. Normal dev mode (via joovy_dev_mode!) always clears this.
+const _selective_mode = Ref{Bool}(false)
+
 # ===================================================================
 # Core: set optlevel on a module and all its submodules
 # ===================================================================
@@ -113,10 +122,20 @@ end
 function joovy_dev_mode!(; tier::Int=1, active::Bool=true)
     _dev_mode[] = active
     _dev_tier[] = tier
+    _selective_mode[] = false   # explicit dev mode always tiers every package
     if active && !_hook_installed[]
         _install_package_hook!()
     end
     return (active=active, tier=tier)
+end
+
+# Used by the Config submodule when the config has per-package tiers but no `default`:
+# install the load hook in selective mode so only configured packages get tiered.
+function _enable_config_hook!(; selective::Bool)
+    _dev_mode[] = true
+    _selective_mode[] = selective
+    _install_package_hook!()
+    return nothing
 end
 
 function joovy_dev_mode_eager!(; tier::Int=1, active::Bool=true)
@@ -201,10 +220,23 @@ function _on_package_load(pkg_id)
             mod = Base.root_module(pkg_id)
             name = nameof(mod)
             name in _SKIP_PACKAGES && return
-            lock(_package_tiers_lock) do
-                haskey(_package_tiers, name) && return
+            already = lock(_package_tiers_lock) do
+                haskey(_package_tiers, name)
             end
-            joovy_use_package(name; tier=_dev_tier[])
+            already && return
+
+            # Per-package config tier overrides the dev default. In selective mode a
+            # package with no config entry is left native (skipped).
+            tier = _dev_tier[]
+            lk = _config_pkg_tier_lookup[]
+            cfg = lk === nothing ? nothing : (try lk(name) catch; nothing end)
+            if cfg isa Int
+                tier = cfg
+            elseif _selective_mode[]
+                return
+            end
+
+            joovy_use_package(name; tier=tier)
         catch
         end
     end

@@ -58,6 +58,11 @@ const _EXEC_MOD = Ref{Module}(Main)
 const _STREAM_STARTED = Ref{Bool}(false)
 const _DIRTY = Ref{Bool}(false)
 
+# Set by the Config submodule to a function `(mod::Symbol, fn::Symbol) -> Union{Int,Nothing}`
+# giving a per-function tier override from LocalPreferences.toml (best-effort: applies to
+# functions Joovy compiles here). nothing = no override.
+const _config_fn_tier_lookup = Ref{Any}(nothing)
+
 # ===================================================================
 # Hot-path counter hooks (referenced from instrumented function bodies)
 # ===================================================================
@@ -210,12 +215,21 @@ function joovy_exec(code::AbstractString; mod::Module=Main, tier::Int=1,
         name = (stmt isa Expr && LazyModules._is_function_def(stmt)) ?
                LazyModules._extract_def_name(stmt) : nothing
         if name !== nothing && instrument !== :none
-            entry = _register_def!(name, stmt, tier, instrument)
-            if lower
+            # Per-function tier override from [Joovy] config wins over the session tier
+            # for this def (best-effort — only user code Joovy compiles here).
+            this_tier = tier
+            lk = _config_fn_tier_lookup[]
+            if lk !== nothing
+                t = try lk(nameof(mod), name) catch; nothing end
+                t isa Int && (this_tier = t)
+            end
+            this_lower = this_tier < 2
+            entry = _register_def!(name, stmt, this_tier, instrument)
+            if this_lower
                 push!(top.args, Meta.parse("Base.Experimental.@optlevel 0"))
             end
             push!(top.args, instrument_expr(stmt, entry, instrument))
-            if lower
+            if this_lower
                 push!(top.args, Meta.parse("Base.Experimental.@optlevel 2"))
             end
             push!(defnames, name)

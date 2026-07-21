@@ -14,6 +14,7 @@ include("LazyModule.jl")
 include("PackageTier.jl")
 include("ColdLoad.jl")
 include("Instrument.jl")
+include("Config.jl")
 include("JoovyObject.jl")
 include("ScriptEngine.jl")
 include("AutoTune.jl")
@@ -41,6 +42,7 @@ using .Debug
 using .IpcBridge
 using .Integration
 using .Warmup
+using .Config
 
 # ExprCache
 export JoovyCache, cache_put!, cache_get, cache_has, cache_register!,
@@ -121,6 +123,24 @@ export JoovySession, session_compile, session_swap!, session_status,
 
 # Warmup
 export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop
+
+# Config
+export joovy_apply_preferences!, joovy_config_status,
+       joovy_config_pkg_tier, joovy_config_fn_tier
+
+# Apply any [Joovy] LocalPreferences.toml tier config on `using Joovy`, so plain-Julia
+# users (no IDE) get declarative tiering with zero extra calls. No-op when there is no
+# config. Skipped during precompile, in remote/native profiling mode, or when opted out.
+function __init__()
+    ccall(:jl_generating_output, Cint, ()) == 1 && return
+    get(ENV, "JULIA_IDE_JOOVY_REMOTE", "") == "1" && return
+    get(ENV, "JOOVY_NO_AUTO_CONFIG", "") == "1" && return
+    try
+        joovy_apply_preferences!()
+    catch e
+        @warn "Joovy: failed to apply LocalPreferences.toml config" exception=(e, catch_backtrace())
+    end
+end
 
 # Test/demo comparison table utilities
 export ComparisonTable, add_row!, print_table, table_all_passed

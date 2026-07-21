@@ -8,6 +8,7 @@ using ..LazyModules
 using ..CompileTimeline
 using ..PackageTier
 using ..Instrument
+using ..Config
 
 export joovy_register_ipc_handlers!, joovy_ipc_available
 
@@ -34,7 +35,7 @@ function joovy_register_ipc_handlers!()
     end
 
     _ipc_registered[] = true
-    _notify("joovy/ready", Dict("version" => "0.1.0"))
+    _notify("joovy/ready", Dict("version" => "0.2.0"))
     return true
 end
 
@@ -377,6 +378,27 @@ function _handle_counters(params)
     return counters_report()
 end
 
+# Re-read LocalPreferences.toml [Joovy] and re-apply tiers without restarting the REPL.
+function _handle_apply_preferences(params)
+    t0 = time_ns()
+    try
+        result = joovy_apply_preferences!()
+        elapsed = time_ns() - t0
+        return Dict(
+            "status"    => "ok",
+            "has_config" => result.has_config,
+            "default"   => result.default === nothing ? nothing : result.default,
+            "packages"  => result.packages,
+            "functions" => result.functions,
+            "time_ns"   => elapsed,
+        )
+    catch e
+        elapsed = time_ns() - t0
+        return Dict("status" => "error", "error" => sprint(showerror, e),
+                     "time_ns" => elapsed)
+    end
+end
+
 function _ipc_handler_table()
     [
         ("compile", _handle_compile),
@@ -393,6 +415,7 @@ function _ipc_handler_table()
         ("dev_mode", _handle_dev_mode),
         ("package_tier", _handle_package_tier),
         ("promote_all", _handle_promote_all),
+        ("apply_preferences", _handle_apply_preferences),
     ]
 end
 
