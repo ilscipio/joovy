@@ -26,22 +26,16 @@ Joovy is a dynamic compilation engine that sits between you and Julia's native c
 
 ## Configuration
 
-You can set tiers declaratively in a `LocalPreferences.toml` file next to your project's `Project.toml` (the standard [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl) location), instead of calling the API by hand. On `using Joovy` the `[Joovy]` section is read and applied automatically — no IDE required.
+You can set tiers in a `LocalPreferences.toml` file next to your `Project.toml`, instead of calling the API by hand. Joovy reads its `[Joovy]` section automatically when you run `using Joovy` — no IDE needed.
 
 ```toml
 [Joovy]
-default = "tier_1"              # global default tier for packages you load
-Makie = "tier_0"                # a package (and its submodules) -> tier 0
-CairoMakie = "tier_0"
-GeometryBasics = "tier_1"
-"MyModule.hot_function" = "tier_2"   # a specific function -> tier 2 (see caveat below)
+default = "tier_1"            # default tier for every package you load
+Makie = "tier_0"              # load this package at tier 0 instead
+"MyModule.hot_fn" = "tier_2"  # one function at tier 2 (best-effort)
 ```
 
-- **`default`** (reserved) — the tier applied to every package you load in this session. Per-package entries override it. Omit `default` and only the packages you list are tiered; everything else stays native.
-- **A bare name** (`Makie`) — matched against packages/modules as they load, so it works even when the package loads after Joovy.
-- **A quoted dotted key** (`"MyModule.hot_function"`) — a per-function override. This is **best-effort**: it applies to functions Joovy itself compiles (your REPL/notebook code). Julia's optimization level is set per *module*, so an already-compiled function inside an external package can't be retiered individually — it falls back to that package's tier.
-
-Tier values accept `"tier_0"`/`"tier_1"`/`"tier_2"`, the bare integers `0`/`1`/`2`, or the aliases `interpreted`/`reduced`/`full`. Edits take effect the next time you start a REPL (or call `joovy_apply_preferences!()`); no recompilation of Joovy is needed.
+Per-package lines override `default`; omit `default` and only the packages you list are tiered. Tier values can be `"tier_0"`/`"tier_1"`/`"tier_2"` or `0`/`1`/`2`, and edits apply on your next REPL start. Per-function keys only affect code Joovy compiles (your own functions), not functions already built into an external package.
 
 ## Quick start
 
