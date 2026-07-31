@@ -10,3 +10,5 @@ Thumbs.db
 *.swo
 *~
 research/
+bench/results/
+bench/.fixture_dataframes/
