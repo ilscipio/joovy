@@ -9,7 +9,8 @@ module Warmup
 # project) is safe here -- it never leaks into the user's REPL or another
 # concurrent call.
 
-export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop
+export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop,
+       warmup_compact!, warmup_should_rebuild
 
 # Pkg and SHA are loaded LAZILY at first use (they are declared in
 # Project.toml [deps], both stdlibs). A top-level `import Pkg` here would make
@@ -134,8 +135,7 @@ function warmup_generate(project::String, trace_dir::String; name::String="Joovy
         return nothing
     end
 
-    trace_files = sort(filter(f -> startswith(f, "trace-") && endswith(f, ".jl"),
-                               readdir(trace_dir)))
+    trace_files = _list_trace_files(trace_dir)
 
     raw_lines = String[]
     for f in trace_files
@@ -170,6 +170,25 @@ function warmup_generate(project::String, trace_dir::String; name::String="Joovy
 end
 
 # --- pure helpers (unit-testable) -----------------------------------------
+
+"""
+    _list_trace_files(trace_dir) -> Vector{String}
+
+Return the sorted basenames of every `trace-*.jl` file directly under
+`trace_dir` (as produced by `julia --trace-compile=<file>`), matching
+`startswith("trace-") && endswith(".jl")` on `readdir(trace_dir)`. Callers
+`joinpath` these with `trace_dir` as needed -- this mirrors the original
+inline filter `warmup_generate` used before it was extracted here.
+
+Note this glob also matches `trace-compacted.jl` (the file
+[`warmup_compact!`](@ref) writes), which is intentional: compacted output
+feeds straight back into the next `warmup_generate` rebuild with no special
+casing needed there.
+"""
+function _list_trace_files(trace_dir::String)::Vector{String}
+    return sort(filter(f -> startswith(f, "trace-") && endswith(f, ".jl"),
+                        readdir(trace_dir)))
+end
 
 """
     _sanitize_trace_lines(lines) -> Vector{String}
@@ -245,6 +264,114 @@ function _write_warmup_src(path::String, name::String, deps::Vector{String}, sta
         println(io)
         println(io, "end # module")
     end
+end
+
+# ===================================================================
+# warmup_compact!: bound trace-dir growth across sessions
+# ===================================================================
+
+"""
+    warmup_compact!(trace_dir::String; stale_after::Real=60, io::IO=stdout) -> NamedTuple
+
+A real project accumulates one `trace-*.jl` file per session forever, and
+[`warmup_generate`](@ref) re-reads every one of them on each rebuild. This
+merges every non-fresh `trace-*.jl` file under `trace_dir` (as listed by
+[`_list_trace_files`](@ref), excluding `trace-compacted.jl` itself and any
+file whose `mtime` is within `stale_after` seconds of `time()` -- likely an
+open session's still-being-written trace) into a single deduplicated,
+sorted `trace-compacted.jl`, then deletes the merged originals so the file
+count (and re-read cost) stops growing without bound.
+
+The existing `trace-compacted.jl`, if any, is read and re-sanitized too and
+unioned into the merge, so repeated calls only ever grow the deduplicated
+statement set -- compacting twice in a row, or re-merging a file whose
+deletion failed, is safe and idempotent. `trace-compacted.jl` is written
+atomically: a temp file in `trace_dir`, then `mv(...; force=true)`.
+
+`warmup_generate`'s trace-file glob (`startswith("trace-") &&
+endswith(".jl")`, see [`_list_trace_files`](@ref)) already matches
+`trace-compacted.jl`, so the compacted output feeds straight into the next
+rebuild -- no changes needed there.
+
+Prints one of:
+
+    __JOOVY_WARMUP_COMPACT__ status=skip reason=julia_version
+    __JOOVY_WARMUP_COMPACT__ status=skip reason=nothing_to_compact
+    __JOOVY_WARMUP_COMPACT__ status=compacted merged=<n> statements=<n> skipped=<n>
+
+`merged` counts original files successfully deleted; `skipped` counts files
+excluded as too-fresh plus originals whose deletion failed (e.g. Windows
+keeping a live session's file open) -- those simply merge again, harmlessly,
+on the next call.
+
+Returns `(status::Symbol, reason::Union{Symbol,Missing}, merged::Int,
+statements::Int, skipped::Int)`.
+"""
+function warmup_compact!(trace_dir::String; stale_after::Real=60, io::IO=stdout)
+    if VERSION < v"1.10"
+        println(io, "__JOOVY_WARMUP_COMPACT__ status=skip reason=julia_version")
+        return (status=:skip, reason=:julia_version, merged=0, statements=0, skipped=0)
+    end
+
+    compacted_name = "trace-compacted.jl"
+    compacted_path = joinpath(trace_dir, compacted_name)
+
+    now = time()
+    candidates = String[]
+    recent_skipped = 0
+    for f in _list_trace_files(trace_dir)
+        f == compacted_name && continue
+        path = joinpath(trace_dir, f)
+        mt = try
+            mtime(path)
+        catch
+            continue # file vanished between readdir and stat; nothing to merge
+        end
+        if now - mt < stale_after
+            recent_skipped += 1
+            continue # likely an open session's live trace; leave it alone
+        end
+        push!(candidates, f)
+    end
+
+    if isempty(candidates)
+        println(io, "__JOOVY_WARMUP_COMPACT__ status=skip reason=nothing_to_compact")
+        return (status=:skip, reason=:nothing_to_compact, merged=0, statements=0, skipped=recent_skipped)
+    end
+
+    raw_lines = String[]
+    for f in candidates
+        append!(raw_lines, readlines(joinpath(trace_dir, f)))
+    end
+    new_statements = _sanitize_trace_lines(raw_lines)
+
+    existing_statements = isfile(compacted_path) ?
+        _sanitize_trace_lines(readlines(compacted_path)) : String[]
+
+    merged = sort!(union(existing_statements, new_statements))
+
+    tmp_path = joinpath(trace_dir, ".$(compacted_name).$(getpid()).tmp")
+    open(tmp_path, "w") do tmp_io
+        for stmt in merged
+            println(tmp_io, stmt)
+        end
+    end
+    mv(tmp_path, compacted_path; force=true)
+
+    deleted = 0
+    failed = 0
+    for f in candidates
+        try
+            rm(joinpath(trace_dir, f))
+            deleted += 1
+        catch
+            failed += 1 # e.g. Windows: file still open by a live session
+        end
+    end
+
+    skipped = failed + recent_skipped
+    println(io, "__JOOVY_WARMUP_COMPACT__ status=compacted merged=$deleted statements=$(length(merged)) skipped=$skipped")
+    return (status=:compacted, reason=missing, merged=deleted, statements=length(merged), skipped=skipped)
 end
 
 # ===================================================================
@@ -349,9 +476,126 @@ function _warmup_build_impl(Pkg::Module, SHA::Module, project::String, warmup_pk
     hash = bytes2hex(SHA.sha256(read(manifest_path)))
     write(joinpath(build_env, ".manifest_hash"), hash * "\n" * basename(manifest_path))
 
+    trace_dir = dirname(warmup_pkg_dir)
+    write(joinpath(build_env, ".trace_state"), string(_trace_bytes_total(trace_dir)))
+
     elapsed = round(time() - t0, digits=1)
     println("__JOOVY_WARMUP_PKG__ status=built elapsed=$elapsed")
     return true
+end
+
+# ===================================================================
+# warmup_should_rebuild: cheap advisory rebuild hint for the IDE
+# ===================================================================
+
+"""
+    warmup_should_rebuild(project, trace_dir; byte_threshold=1_000_000) -> NamedTuple
+
+Advisory-only, cheap check for whether the IDE should re-run
+[`warmup_generate`](@ref)/[`warmup_build`](@ref) rather than reuse the
+existing built package. Compares two independent signals against the state
+recorded by the last successful [`warmup_build`](@ref) (both files live
+under `<trace_dir>/_build_env`, alongside `.manifest_hash`):
+
+  - The project's *current* active manifest (see
+    [`_active_manifest_path`](@ref)) hashed the same way
+    [`_warmup_build_impl`](@ref) hashes it, compared against the stored
+    `.manifest_hash`.
+  - The current total byte size of every `trace-*.jl` file (see
+    [`_list_trace_files`](@ref)) compared against the size recorded at the
+    last build time in `.trace_state`.
+
+This never builds or mutates anything -- it only reads state and reports a
+recommendation.
+
+Prints:
+
+    __JOOVY_WARMUP_SHOULD_REBUILD__ should_rebuild=<bool> reason=<reason>
+
+`reason` is one of:
+
+  - `:julia_version`    -- Julia < 1.10, the advisory is unavailable.
+  - `:never_built`      -- no recorded `.manifest_hash` yet.
+  - `:manifest_changed` -- the project's active manifest no longer matches
+                           the hash recorded at the last build.
+  - `:trace_growth`     -- the manifest still matches, but trace files have
+                           grown by at least `byte_threshold` bytes since
+                           the last build.
+  - `:up_to_date`        -- neither of the above triggered.
+
+Returns `(should_rebuild::Bool, reason::Symbol,
+manifest_changed::Union{Bool,Missing}, bytes_delta::Union{Int,Missing})`.
+`manifest_changed`/`bytes_delta` are `missing` when they could not be
+computed (e.g. no prior build, or no `.trace_state` recorded yet -- in which
+case the recommendation relies on the manifest comparison alone).
+"""
+function warmup_should_rebuild(project::String, trace_dir::String;
+                                byte_threshold::Integer=1_000_000)
+    if VERSION < v"1.10"
+        println("__JOOVY_WARMUP_SHOULD_REBUILD__ should_rebuild=false reason=julia_version")
+        return (should_rebuild=false, reason=:julia_version,
+                manifest_changed=missing, bytes_delta=missing)
+    end
+
+    build_env = joinpath(trace_dir, "_build_env")
+    hash_file = joinpath(build_env, ".manifest_hash")
+
+    if !isfile(hash_file)
+        println("__JOOVY_WARMUP_SHOULD_REBUILD__ should_rebuild=true reason=never_built")
+        return (should_rebuild=true, reason=:never_built,
+                manifest_changed=missing, bytes_delta=missing)
+    end
+
+    # Lazy SHA + invokelatest: see joovy_warm for the world-age rationale.
+    manifest_changed = Base.invokelatest(_manifest_changed, _sha(), project, hash_file)
+    bytes_delta = _trace_bytes_delta(trace_dir, build_env)
+
+    should_rebuild = manifest_changed === true ||
+                     (bytes_delta !== missing && bytes_delta >= byte_threshold)
+
+    reason = if manifest_changed === true
+        :manifest_changed
+    elseif bytes_delta !== missing && bytes_delta >= byte_threshold
+        :trace_growth
+    else
+        :up_to_date
+    end
+
+    println("__JOOVY_WARMUP_SHOULD_REBUILD__ should_rebuild=$should_rebuild reason=$reason")
+    return (should_rebuild=should_rebuild, reason=reason,
+            manifest_changed=manifest_changed, bytes_delta=bytes_delta)
+end
+
+# `hash_file` holds two lines: hex sha256 of the manifest's bytes, then its
+# basename (see `_warmup_build_impl`). Only the hash is compared here.
+function _manifest_changed(SHA::Module, project::String, hash_file::String)::Union{Bool,Missing}
+    manifest_path = _active_manifest_path(project)
+    manifest_path === nothing && return missing
+    stored_lines = readlines(hash_file)
+    isempty(stored_lines) && return missing
+    stored_hash = lowercase(strip(stored_lines[1]))
+    current_hash = lowercase(bytes2hex(SHA.sha256(read(manifest_path))))
+    return current_hash != stored_hash
+end
+
+function _trace_bytes_total(trace_dir::String)::Int
+    total = 0
+    for f in _list_trace_files(trace_dir)
+        try
+            total += filesize(joinpath(trace_dir, f))
+        catch
+            # file vanished between readdir and stat; just don't count it.
+        end
+    end
+    return total
+end
+
+function _trace_bytes_delta(trace_dir::String, build_env::String)::Union{Int,Missing}
+    state_file = joinpath(build_env, ".trace_state")
+    isfile(state_file) || return missing
+    stored = tryparse(Int, strip(read(state_file, String)))
+    stored === nothing && return missing
+    return _trace_bytes_total(trace_dir) - stored
 end
 
 # ===================================================================
@@ -377,6 +621,7 @@ or names) from `input` until EOF or an `EXIT` command:
 
     WARM\\t<pkg1,pkg2,...>\\t<cancel_file_path_or_->
     BUILD\\t<project_dir>\\t<trace_dir>
+    COMPACT\\t<trace_dir>
     EXIT
 
 `WARM` reuses [`_joovy_warm_impl`](@ref) (with `project=nothing`, since the
@@ -385,7 +630,10 @@ daemon's active project already IS the target project), printing the usual
 [`warmup_generate`](@ref) then, if it returns a package dir,
 [`_warmup_build_impl`](@ref) -- both mutate the active project via
 `Pkg.activate`, so the project active before the command is captured and
-restored in a `finally`.
+restored in a `finally`. `COMPACT` reuses [`warmup_compact!`](@ref) directly
+against the given `trace_dir`, printing the usual `__JOOVY_WARMUP_COMPACT__`
+marker; unlike `WARM`/`BUILD` it does no `Pkg.activate` (pure file I/O), so
+there is no active-project save/restore to do.
 
 After EVERY command (success, failure, or unknown) prints and flushes:
 
@@ -450,6 +698,10 @@ function warm_daemon_loop(; input::IO=stdin, io::IO=stdout)
                 finally
                     saved === nothing || Base.invokelatest(Pkg.activate, dirname(saved); io=devnull)
                 end
+            elseif cmd == "COMPACT"
+                length(parts) >= 2 || error("COMPACT requires <trace_dir>")
+                trace_dir = String(parts[2])
+                warmup_compact!(trace_dir; io=io)
             else
                 println(io, "__JOOVY_DAEMON_ERR__ unknown command: $cmd")
             end

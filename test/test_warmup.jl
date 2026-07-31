@@ -215,6 +215,85 @@ import SHA
     end
 
     # ---------------------------------------------------------------
+    # warmup_compact!
+    # On Julia < 1.10 warmup_compact! skips by design, mirroring the other
+    # Warmup entry points.
+    # ---------------------------------------------------------------
+    if VERSION < v"1.10"
+        @testset "warmup_compact! skips on old Julia" begin
+            tmp = mktempdir()
+            out = IOBuffer()
+            result = warmup_compact!(tmp; io=out)
+            @test occursin("__JOOVY_WARMUP_COMPACT__ status=skip reason=julia_version", String(take!(out)))
+            @test result.status == :skip
+            @test result.reason == :julia_version
+        end
+    end
+
+    if VERSION >= v"1.10"
+    @testset "warmup_compact!" begin
+        tmp = mktempdir()
+
+        # 3 fake trace files with overlapping precompile lines, a Main.
+        # line that must be dropped, and a timing-prefixed line.
+        write(joinpath(tmp, "trace-1.jl"), """
+        precompile(Tuple{typeof(Base.sum), Vector{Int64}})   # recompile
+        precompile(Tuple{typeof(Main.foo), Int64})
+        #=   1.2 ms =# precompile(Tuple{typeof(Base.:(+)), Int64, Int64})
+        """)
+        write(joinpath(tmp, "trace-2.jl"), """
+        precompile(Tuple{typeof(Base.sum), Vector{Int64}})
+        precompile(Tuple{typeof(Base.:(-)), Int64, Int64})
+        """)
+        write(joinpath(tmp, "trace-3.jl"), """
+        precompile(Tuple{typeof(Base.:(-)), Int64, Int64})
+        precompile(Tuple{typeof(Base.:(*)), Int64, Int64})
+        """)
+
+        out = IOBuffer()
+        result = warmup_compact!(tmp; stale_after=0, io=out)
+        output = String(take!(out))
+
+        @test occursin("__JOOVY_WARMUP_COMPACT__ status=compacted", output)
+        @test result.status == :compacted
+        @test result.merged == 3
+        @test result.skipped == 0
+
+        compacted_path = joinpath(tmp, "trace-compacted.jl")
+        @test isfile(compacted_path)
+        @test !isfile(joinpath(tmp, "trace-1.jl"))
+        @test !isfile(joinpath(tmp, "trace-2.jl"))
+        @test !isfile(joinpath(tmp, "trace-3.jl"))
+
+        merged_lines = readlines(compacted_path)
+        @test merged_lines == sort(unique(merged_lines))
+        @test !any(l -> occursin("Main.", l), merged_lines)
+        @test !any(l -> occursin("#=", l), merged_lines)
+        @test !any(l -> occursin("# recompile", l), merged_lines)
+        @test result.statements == length(merged_lines)
+        @test length(merged_lines) == 4 # sum, +, -, * (deduped across the 3 files)
+
+        # --- idempotency: re-running immediately must not error and must
+        # not change the merged statement count (nothing left to compact). ---
+        out2 = IOBuffer()
+        result2 = warmup_compact!(tmp; stale_after=0, io=out2)
+        @test result2.status == :skip
+        @test length(readlines(compacted_path)) == length(merged_lines)
+
+        # --- freshness guard: a brand-new trace file within stale_after
+        # seconds of "now" is left untouched (may be an open session's live
+        # trace). ---
+        write(joinpath(tmp, "trace-4.jl"), "precompile(Tuple{typeof(Base.sum), Vector{Int64}})\n")
+        out3 = IOBuffer()
+        result3 = warmup_compact!(tmp; stale_after=10_000, io=out3)
+        output3 = String(take!(out3))
+
+        @test isfile(joinpath(tmp, "trace-4.jl")) # untouched
+        @test occursin("status=skip", output3) || result3.skipped >= 1
+    end
+    end # VERSION >= v"1.10" (warmup_compact!)
+
+    # ---------------------------------------------------------------
     # _active_manifest_path
     # ---------------------------------------------------------------
     @testset "_active_manifest_path" begin
@@ -246,6 +325,83 @@ import SHA
         tmp3 = mktempdir()
         @test Joovy.Warmup._active_manifest_path(tmp3) === nothing
     end
+
+    # ---------------------------------------------------------------
+    # warmup_should_rebuild
+    # On Julia < 1.10 it skips by design, mirroring the other Warmup entry
+    # points.
+    # ---------------------------------------------------------------
+    if VERSION < v"1.10"
+        @testset "warmup_should_rebuild skips on old Julia" begin
+            tmp = mktempdir()
+            r = warmup_should_rebuild(tmp, tmp)
+            @test r.should_rebuild == false
+            @test r.reason == :julia_version
+            @test r.manifest_changed === missing
+            @test r.bytes_delta === missing
+        end
+    end
+
+    if VERSION >= v"1.10"
+    @testset "warmup_should_rebuild" begin
+        tmp = mktempdir()
+        project_dir = joinpath(tmp, "proj")
+        mkpath(project_dir)
+        write(joinpath(project_dir, "Project.toml"), "name = \"Proj\"\n")
+        manifest_path = joinpath(project_dir, "Manifest.toml")
+        write(manifest_path, "julia_version = \"$(VERSION)\"\n")
+        @test Joovy.Warmup._active_manifest_path(project_dir) == manifest_path
+
+        trace_dir = joinpath(tmp, "traces")
+        mkpath(trace_dir)
+        build_env = joinpath(trace_dir, "_build_env")
+        mkpath(build_env)
+
+        # Fabricate `.manifest_hash` using the SAME recipe _warmup_build_impl
+        # uses: hex sha256 of the manifest bytes, then its basename.
+        hash_file = joinpath(build_env, ".manifest_hash")
+        hash = bytes2hex(SHA.sha256(read(manifest_path)))
+        write(hash_file, hash * "\n" * basename(manifest_path))
+
+        write(joinpath(trace_dir, "trace-1.jl"), "precompile(Tuple{typeof(Base.sum), Vector{Int64}})\n")
+        trace_state_file = joinpath(build_env, ".trace_state")
+        write(trace_state_file, string(filesize(joinpath(trace_dir, "trace-1.jl"))))
+
+        # (a) matching manifest hash + unchanged trace-file total -> up_to_date
+        r = warmup_should_rebuild(project_dir, trace_dir; byte_threshold=1_000_000)
+        @test r.should_rebuild == false
+        @test r.reason == :up_to_date
+        @test r.manifest_changed == false
+        @test r.bytes_delta == 0
+
+        # (b) mutate the manifest -> manifest_changed (takes priority over
+        # trace growth in the reported reason).
+        write(manifest_path, "julia_version = \"$(VERSION)\"\nextra = true\n")
+        r = warmup_should_rebuild(project_dir, trace_dir; byte_threshold=1_000_000)
+        @test r.should_rebuild == true
+        @test r.reason == :manifest_changed
+        @test r.manifest_changed == true
+
+        # (c) restore the manifest, reset .trace_state to 0, then add a
+        # trace file bigger than a small byte_threshold -> trace_growth.
+        write(manifest_path, "julia_version = \"$(VERSION)\"\n")
+        write(trace_state_file, "0")
+        write(joinpath(trace_dir, "trace-2.jl"), "precompile(Tuple{typeof(Base.:(+)), Int64, Int64})\n")
+        r = warmup_should_rebuild(project_dir, trace_dir; byte_threshold=5)
+        @test r.should_rebuild == true
+        @test r.reason == :trace_growth
+        @test r.manifest_changed == false
+        @test r.bytes_delta !== missing && r.bytes_delta >= 5
+
+        # (d) no recorded build at all -> never_built.
+        rm(hash_file)
+        r = warmup_should_rebuild(project_dir, trace_dir; byte_threshold=1_000_000)
+        @test r.should_rebuild == true
+        @test r.reason == :never_built
+        @test r.manifest_changed === missing
+        @test r.bytes_delta === missing
+    end
+    end # VERSION >= v"1.10" (warmup_should_rebuild)
 
     # ---------------------------------------------------------------
     # warm_daemon_loop: in-process, using IOBuffer pipes against the CURRENT
@@ -281,6 +437,27 @@ import SHA
         exit_pos = findfirst("__JOOVY_DAEMON__ status=exit", output)
         done_pos = findfirst("__JOOVY_WARM_DONE__", output)
         @test first(done_pos) < first(idle_pos) < first(exit_pos)
+    end
+
+    @testset "warm_daemon_loop COMPACT command" begin
+        tmp = mktempdir()
+        # The daemon protocol has no way to pass a custom stale_after, so
+        # COMPACT always uses warmup_compact!'s default (60s). A file
+        # written moments ago is thus "too fresh" and left alone -- this
+        # exercises the freshness guard end-to-end through the COMPACT
+        # dispatch without relying on a timing race.
+        write(joinpath(tmp, "trace-1.jl"), "precompile(Tuple{typeof(Base.sum), Vector{Int64}})\n")
+
+        input = IOBuffer("COMPACT\t$tmp\nEXIT\n")
+        out = IOBuffer()
+        warm_daemon_loop(input=input, io=out)
+        output = String(take!(out))
+
+        @test occursin("__JOOVY_DAEMON__ status=ready", output)
+        @test occursin("__JOOVY_WARMUP_COMPACT__ status=skip reason=nothing_to_compact", output)
+        @test occursin("__JOOVY_DAEMON__ status=idle", output)
+        @test occursin("__JOOVY_DAEMON__ status=exit", output)
+        @test isfile(joinpath(tmp, "trace-1.jl")) # untouched -- too fresh to compact
     end
 
     @testset "warm_daemon_loop unknown/malformed commands" begin
