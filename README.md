@@ -24,6 +24,25 @@ Joovy is a dynamic compilation engine that sits between you and Julia's native c
 
 **Hot-swapping.** Register a function by name, swap its implementation at runtime. Version history is tracked. File-based reload with dependency-aware invalidation.
 
+## Incremental reload
+
+When the IDE saves a file, `joovy_hot_reload` (and the `joovy/reload` IPC route) hash
+each definition and re-evaluate only the ones that changed, instead of the whole file.
+This also fixes hot-swap entries: each one now maps to its own compiled function, not
+whichever function happened to compile first. Pass `incremental=false` to fall back to
+the old re-evaluate-everything behavior. Measured on a 50-definition file with a
+1-definition edit: 1 re-evaluation instead of 50, and the reload itself runs 5.5x faster.
+
+## Speculative compilation
+
+`SpecQueue` compiles likely-next lazy-module functions in the background, one function
+per quantum, so the REPL stays responsive while it works. It is off by default. Turn it
+on with `joovy_speculate!(true)`, the `speculate = true` preference key, or by letting
+the IDE send the `joovy/promote` intent route, which force-enables it. Measured on a
+40-definition module, speculation cuts the first-call burst from 518ms to 62ms (8.4x).
+Native codegen per call still happens on demand, so a single first call only improves
+about 1.6x; the win is the burst across many first calls.
+
 ## Configuration
 
 You can set tiers in a `LocalPreferences.toml` file next to your `Project.toml`, instead of calling the API by hand. Joovy reads its `[Joovy]` section automatically when you run `using Joovy` — no IDE needed.
@@ -33,9 +52,10 @@ You can set tiers in a `LocalPreferences.toml` file next to your `Project.toml`,
 default = "tier_1"            # default tier for every package you load
 Makie = "tier_0"              # load this package at tier 0 instead
 "MyModule.hot_fn" = "tier_2"  # one function at tier 2 (best-effort)
+speculate = true              # enable speculative background compilation (default false)
 ```
 
-Per-package lines override `default`; omit `default` and only the packages you list are tiered. Tier values can be `"tier_0"`/`"tier_1"`/`"tier_2"` or `0`/`1`/`2`, and edits apply on your next REPL start. Per-function keys only affect code Joovy compiles (your own functions), not functions already built into an external package.
+Per-package lines override `default`; omit `default` and only the packages you list are tiered. Tier values can be `"tier_0"`/`"tier_1"`/`"tier_2"` or `0`/`1`/`2`, and edits apply on your next REPL start. Per-function keys only affect code Joovy compiles (your own functions), not functions already built into an external package. The `speculate` key is a bool, default false; it turns on background speculative compilation (see below) at `using Joovy` time, same as calling `joovy_speculate!(true)`.
 
 ## Quick start
 
@@ -66,9 +86,9 @@ Joovy is the backend for the [Flexible Julia](https://plugins.jetbrains.com/plug
 
 ## Background warmup
 
-`joovy_warm` precompiles a list of packages one at a time in a background process, so the depot cache is warm before you need it. `warmup_generate` turns a `--trace-compile` log into a standalone `JoovyWarmup` package covering your project's actual call patterns, and `warmup_build` precompiles that package against your project's exact dependency resolution. The IDE runs all three automatically; you normally never call them yourself.
+`joovy_warm` precompiles a list of packages one at a time in a background process, so the depot cache is warm before you need it. `warmup_generate` turns a `--trace-compile` log into a standalone `JoovyWarmup` package covering your project's actual call patterns, and `warmup_build` precompiles that package against your project's exact dependency resolution. The IDE runs all three automatically; you normally never call them yourself. For long-lived projects, `warmup_compact!` merges accumulated trace files into one deduped file so trace-dir growth stays bounded, and `warmup_should_rebuild` gives the IDE a cheap advisory signal for when a rebuild is due.
 
-Julia 1.12 has a community-documented startup regression versus 1.10 on large package sets (~50% slower across 1000 packages, per reports on the JuliaLang discourse). Joovy's cold-load tiering and background warmup claw back that regression and then some: 3x faster cold time-to-first-plot on Plots, and 85% faster time-to-first-execution via trace-driven warmup, measured on 1.12.3.
+Julia 1.12 has a community-documented startup regression versus 1.10 on large package sets (~50% slower across 1000 packages, per reports on the JuliaLang discourse). Joovy's cold-load tiering and background warmup claw back that regression and then some: 3x faster cold time-to-first-plot on Plots, and 85% faster time-to-first-execution via trace-driven warmup, as reported anecdotally on 1.12.3. Our own reproducible measurement, using the `bench/run_benchmarks.jl` harness against a DataFrames fixture, shows cold time-to-first-execution dropping from 879ms to 24ms warm (97% faster). Run the harness yourself to measure your project.
 
 ```julia
 using Joovy
