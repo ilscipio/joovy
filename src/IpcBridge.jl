@@ -108,6 +108,7 @@ end
 function _handle_reload(params)
     file = get(params, "file", "")
     isempty(file) && return Dict("error" => "Missing file parameter")
+    incremental = get(params, "incremental", true)
 
     abs_path = abspath(file)
     t0 = time_ns()
@@ -131,7 +132,7 @@ function _handle_reload(params)
             _notify("joovy/swap_status", resp)
             return resp
         else
-            result = joovy_hot_reload(file)
+            result = joovy_hot_reload(file; incremental=incremental)
             elapsed = time_ns() - t0
             resp = Dict(
                 "status" => result.status,
@@ -140,6 +141,10 @@ function _handle_reload(params)
                 "reloaded" => [string(n) for n in result.reloaded],
                 "unchanged" => [string(n) for n in result.unchanged],
                 "fallback_definitions" => result.fallback_definitions,
+                "defs_changed" => length(result.fallback_changed) + length(result.reloaded),
+                "defs_added" => length(result.fallback_added),
+                "defs_removed" => length(result.fallback_removed),
+                "defs_unchanged" => length(result.fallback_unchanged) + length(result.unchanged),
                 "time_ns" => elapsed
             )
             if result.error !== nothing

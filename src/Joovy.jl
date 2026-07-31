@@ -59,8 +59,8 @@ export joovy_compile, joovy_compile_file, joovy_recompile!,
 
 # HotSwap
 export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
-       hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_version,
-       hotswap_history, GLOBAL_REGISTRY
+       hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_reload_file!,
+       hotswap_version, hotswap_history, GLOBAL_REGISTRY
 
 # StaticCompile
 export TypedJoovyCallable, FullyTypedJoovyCallable,

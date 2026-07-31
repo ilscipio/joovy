@@ -4,8 +4,8 @@ using ..ExprCache
 using ..DynCompiler
 
 export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
-       hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_version,
-       hotswap_history, GLOBAL_REGISTRY
+       hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_reload_file!,
+       hotswap_version, hotswap_history, GLOBAL_REGISTRY
 
 const _swap_guard_hooks = Function[]
 const _swap_guard_hooks_lock = ReentrantLock()
@@ -178,6 +178,82 @@ function hotswap_reload!(name::Symbol;
     end
 
     return new_compiled
+end
+
+# Reload ALL SwapEntries backed by `file` with a SINGLE parse + SINGLE compile of the
+# whole file, instead of recompiling the file once per entry (as looping `hotswap_reload!`
+# over each entry would do). Each entry's own compiled symbol is looked up by matching the
+# entry's registry `name` against the shared SourceMapping produced by that one compile, so
+# every entry gets ITS OWN function rather than all entries silently aliasing the file's
+# first function.
+#
+# Convention: an entry's registry name must match the name of the definition it tracks
+# inside the file (this is how the IDE registers per-definition entries). If a changed
+# entry's name cannot be resolved in the fresh compile's SourceMapping, that is a usage
+# error and raises.
+function hotswap_reload_file!(file::String;
+                              registry::HotSwapRegistry=GLOBAL_REGISTRY,
+                              mod::Module=Main)
+    file = abspath(file)
+    if !isfile(file)
+        error("File not found: $file")
+    end
+
+    new_source = read(file, String)
+
+    matching = Tuple{Symbol,SwapEntry}[]
+    lock(registry.lock) do
+        for (name, entry) in registry.entries
+            entry_path = entry.file_path
+            entry_path === nothing && continue
+            if abspath(entry_path) == file
+                push!(matching, (name, entry))
+            end
+        end
+    end
+
+    reloaded = Symbol[]
+    unchanged = Symbol[]
+    changed_entries = Tuple{Symbol,SwapEntry}[]
+
+    for (name, entry) in matching
+        old_source = lock(entry.lock) do
+            entry.source
+        end
+        if new_source != old_source
+            push!(reloaded, name)
+            push!(changed_entries, (name, entry))
+        else
+            push!(unchanged, name)
+        end
+    end
+
+    if !isempty(changed_entries)
+        expr = Meta.parse("begin\n" * new_source * "\nend")
+        compile_expr_raw(mod, expr, file)
+
+        for (name, entry) in changed_entries
+            mapping = source_map_lookup(name)
+            mapping === nothing &&
+                error("hotswap_reload_file!: no compiled definition named :$name found in $file")
+
+            idx = findfirst(==(name), mapping.original_names)
+            idx === nothing &&
+                error("hotswap_reload_file!: no compiled definition named :$name found in $file")
+
+            renamed = mapping.compiled_names[idx]
+            fn = JoovyCallable(Base.invokelatest(getfield, mod, renamed))
+
+            lock(entry.lock) do
+                entry.version += 1
+                entry.current_fn = fn
+                entry.source = new_source
+                push!(entry.history, entry.version => new_source)
+            end
+        end
+    end
+
+    return (reloaded=reloaded, unchanged=unchanged)
 end
 
 function hotswap_version(name::Symbol;

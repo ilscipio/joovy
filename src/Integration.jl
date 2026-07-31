@@ -61,8 +61,9 @@ function session_eval(session::JoovySession, code::String; mod::Module=Main)
     end
 end
 
-function session_hot_reload(session::JoovySession, file::String; mod::Module=Main)
-    joovy_hot_reload(file; registry=session.registry, mod=mod)
+function session_hot_reload(session::JoovySession, file::String; mod::Module=Main,
+                             incremental::Bool=true)
+    joovy_hot_reload(file; registry=session.registry, mod=mod, incremental=incremental)
 end
 
 function session_connect_ide!(session::JoovySession)
