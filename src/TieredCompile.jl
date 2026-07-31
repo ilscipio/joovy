@@ -10,6 +10,12 @@ export TieredCallable, joovy_compile_tiered, promote!, get_tier,
 const _tier_compile_lock = ReentrantLock()
 const _show_stats = Ref(get(ENV, "JULIA_IDE_JOOVY_STATS", "") == "1")
 
+# Set by the SpecQueue submodule (include-order forbids importing it here) to a function
+# `tc::TieredCallable -> Any`, fired asynchronously whenever a TieredCallable is promoted
+# to a higher tier, so speculative compilation can react to promotions (e.g. warm the
+# promoted function's callees at a higher tier too).
+const _on_promote_hook = Ref{Any}(nothing)
+
 # Lever: whether tier-1 injects @nospecialize on function arguments.
 # Default comes from the JULIA_IDE_JOOVY_NOSPECIALIZE env var (a "startup parameter"
 # you can pass when launching the IDE); toggle at runtime with set_nospecialize!.
@@ -30,6 +36,7 @@ mutable struct TieredCallable <: AbstractJoovyCallable
     mod::Module
     promoting::Bool
     lock::ReentrantLock
+    owner::Any
 end
 
 @inline function (tc::TieredCallable)(args...; kwargs...)
@@ -172,8 +179,8 @@ function compile_in_module!(mod::Module, expr::Expr, name::Symbol, tier::Int)
 end
 
 function make_tiered_callable(fn, tier::Int, code::String, name::Symbol,
-                              mod::Module; promote_threshold::Int=10)
-    TieredCallable(fn, tier, 0, code, name, promote_threshold, mod, false, ReentrantLock())
+                              mod::Module; promote_threshold::Int=10, owner=nothing)
+    TieredCallable(fn, tier, 0, code, name, promote_threshold, mod, false, ReentrantLock(), owner)
 end
 
 # ===================================================================
@@ -231,6 +238,14 @@ function promote!(tc::TieredCallable; tier::Union{Int,Nothing}=nothing)
     if _show_stats[]
         time_str = elapsed < 1_000_000 ? "$(round(elapsed / 1_000; digits=1))μs" : "$(round(elapsed / 1_000_000; digits=2))ms"
         @info "joovy promote: $(tc.name) tier=$(target) $(time_str) calls=$(tc.call_count)"
+    end
+
+    hook = _on_promote_hook[]
+    if hook !== nothing
+        @async try
+            hook(tc)
+        catch
+        end
     end
 
     return tc

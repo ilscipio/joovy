@@ -9,6 +9,7 @@ using ..CompileTimeline
 using ..PackageTier
 using ..Instrument
 using ..Config
+using ..SpecQueue
 
 export joovy_register_ipc_handlers!, joovy_ipc_available
 
@@ -404,6 +405,59 @@ function _handle_apply_preferences(params)
     end
 end
 
+# Explicit IDE "promote" intent: enqueue a lazy module's function (and its transitive
+# dependency subtree) -- or every definition in the module -- for speculative background
+# compilation at `tier`. Force-enables speculation, since an explicit IPC call from the
+# IDE is unambiguous user/tooling intent regardless of the current opt-in flag.
+function _handle_promote(params)
+    path = get(params, "path", "")
+    isempty(path) && return Dict("error" => "Missing path parameter")
+    tier = get(params, "tier", 2)
+    fn_str = get(params, "function", nothing)
+
+    t0 = time_ns()
+    try
+        SpecQueue.joovy_speculate!(true)
+
+        abs_path = abspath(path)
+        lm = lock(_lazy_modules_lock) do
+            get(_lazy_modules, abs_path, nothing)
+        end
+        if lm === nothing
+            return Dict("status" => "error",
+                        "error" => "Unknown lazy module (call joovy/use first): $path")
+        end
+
+        n = if fn_str !== nothing
+            name = Symbol(fn_str)
+            if !haskey(lm.definitions, name)
+                return Dict("status" => "error",
+                            "error" => "Unknown function `$fn_str` in $path")
+            end
+            SpecQueue.spec_enqueue_subtree!(lm, name; tier=tier, class=3)
+        else
+            SpecQueue.spec_enqueue_all!(lm; tier=tier, class=3)
+        end
+
+        elapsed = time_ns() - t0
+        resp = Dict(
+            "status" => "ok",
+            "path" => abs_path,
+            "enqueued" => n,
+            "queue_depth" => SpecQueue.spec_stats().queue_depth,
+            "time_ns" => elapsed
+        )
+        _notify("joovy/promote_status", resp)
+        return resp
+    catch e
+        elapsed = time_ns() - t0
+        err = Dict("status" => "error", "error" => sprint(showerror, e),
+                    "path" => path, "time_ns" => elapsed)
+        _notify("joovy/error", err)
+        return err
+    end
+end
+
 function _ipc_handler_table()
     [
         ("compile", _handle_compile),
@@ -421,6 +475,7 @@ function _ipc_handler_table()
         ("package_tier", _handle_package_tier),
         ("promote_all", _handle_promote_all),
         ("apply_preferences", _handle_apply_preferences),
+        ("promote", _handle_promote),
     ]
 end
 

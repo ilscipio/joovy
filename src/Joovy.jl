@@ -14,6 +14,7 @@ include("LazyModule.jl")
 include("PackageTier.jl")
 include("ColdLoad.jl")
 include("Instrument.jl")
+include("SpecQueue.jl")
 include("Config.jl")
 include("JoovyObject.jl")
 include("ScriptEngine.jl")
@@ -33,6 +34,7 @@ using .TieredCompile
 using .MemoryManager
 using .LazyModules
 using .Instrument
+using .SpecQueue
 using .ColdLoad
 using .PackageTier
 using .JoovyObjects
@@ -88,6 +90,10 @@ export LazyModule, joovy_use, joovy_reload!, joovy_watch_lazy!, joovy_promote_la
 export CounterEntry, joovy_exec, instrument_expr, counters_report,
        start_counter_stream!, reset_counters!
 
+# SpecQueue
+export spec_enqueue!, spec_enqueue_all!, spec_enqueue_subtree!, spec_stats,
+       spec_pause!, spec_resume!, spec_kill!, joovy_speculate!, joovy_speculate_enabled
+
 # ColdLoad
 export prepare_cold_load!, finish_cold_load!, cold_load_active
 
@@ -122,7 +128,8 @@ export JoovySession, session_compile, session_swap!, session_status,
        session_compile_tiered, session_use, session_compile_timeline
 
 # Warmup
-export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop
+export joovy_warm, warmup_generate, warmup_build, warm_daemon_loop,
+       warmup_compact!, warmup_should_rebuild
 
 # Config
 export joovy_apply_preferences!, joovy_config_status,

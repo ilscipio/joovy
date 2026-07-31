@@ -23,6 +23,14 @@ end
 
 const _LAZY_MODULE_FIELDS = fieldnames(LazyModule)
 
+# Set by the SpecQueue submodule (include-order forbids importing it here) to functions
+# fired asynchronously as speculative-compilation producer signals:
+#   _on_use_hook[]          :: (lm::LazyModule) -> Any            -- fired after joovy_use
+#   _on_first_access_hook[] :: (lm::LazyModule, name::Symbol) -> Any -- fired after a
+#                              synchronous first-access compile (Base.getproperty)
+const _on_use_hook = Ref{Any}(nothing)
+const _on_first_access_hook = Ref{Any}(nothing)
+
 # ===================================================================
 # AST splitting: preamble vs definitions
 # ===================================================================
@@ -186,7 +194,7 @@ function _compile_subtree!(lm::LazyModule, name::Symbol)
             elapsed = time_ns() - t0
 
             tc = make_tiered_callable(fn, lm.default_tier, code, sym, lm.mod;
-                                      promote_threshold=lm.promote_threshold)
+                                      promote_threshold=lm.promote_threshold, owner=lm)
 
             record_compile!(CompileEvent(
                 sym, lm.default_tier, UInt64(elapsed), :first_call,
@@ -237,9 +245,17 @@ function Base.getproperty(lm::LazyModule, name::Symbol)
     compiled = getfield(lm, :compiled)
     existing = get(compiled, name, nothing)
     existing !== nothing && return existing
-    lock(getfield(lm, :lock)) do
+    result = lock(getfield(lm, :lock)) do
         _compile_subtree!(lm, name)
     end
+    hook = _on_first_access_hook[]
+    if hook !== nothing
+        @async try
+            hook(lm, name)
+        catch
+        end
+    end
+    return result
 end
 
 function Base.propertynames(lm::LazyModule)
@@ -273,11 +289,21 @@ function joovy_use(path::String; mod::Module=Main, tier::Int=1,
         source_hashes[name] = hash(string(expr))
     end
 
-    return LazyModule(
+    lm = LazyModule(
         abspath(path), mod, preamble, definitions, deps, reverse_deps,
         Dict{Symbol, TieredCallable}(), source_hashes,
         tier, promote_threshold, ReentrantLock()
     )
+
+    hook = _on_use_hook[]
+    if hook !== nothing
+        @async try
+            hook(lm)
+        catch
+        end
+    end
+
+    return lm
 end
 
 function joovy_reload!(lm::LazyModule)

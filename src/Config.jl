@@ -26,6 +26,7 @@ module Config
 
 import ..PackageTier
 import ..Instrument
+import ..SpecQueue
 import TOML
 
 export joovy_apply_preferences!, joovy_config_status,
@@ -56,6 +57,20 @@ function _parse_tier(x)::Union{Int,Nothing}
         s in ("tier_1", "tier1", "1", "reduced", "fast", "low")    && return 1
         s in ("tier_2", "tier2", "2", "full", "native", "opt")     && return 2
         return nothing
+    end
+    return nothing
+end
+
+# ===================================================================
+# Bool-value parsing for the reserved `speculate` key -> Bool/nothing
+# ===================================================================
+
+function _parse_bool(x)::Union{Bool,Nothing}
+    x isa Bool && return x
+    if x isa AbstractString
+        s = lowercase(strip(x))
+        s == "true"  && return true
+        s == "false" && return false
     end
     return nothing
 end
@@ -154,6 +169,13 @@ function _apply_prefs!(prefs::AbstractDict; fallback_tier::Union{Int,Nothing}=no
                 t === nothing ?
                     @warn("Joovy config: invalid tier for `default`: $(repr(val)) (ignored)") :
                     (_default_tier[] = t)
+                continue
+            end
+            if key == "speculate"
+                b = _parse_bool(val)
+                b === nothing ?
+                    @warn("Joovy config: invalid value for `speculate`: $(repr(val)) (ignored)") :
+                    SpecQueue.joovy_speculate!(b)
                 continue
             end
             t = _parse_tier(val)

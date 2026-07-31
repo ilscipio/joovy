@@ -90,6 +90,36 @@ end
         @test r.functions == 0
     end
 
+    @testset "speculate key" begin
+        _reset_tier_state!()
+        SQ = Joovy.SpecQueue
+        SQ.joovy_speculate!(false)
+
+        r1 = Cfg._apply_prefs!(Dict{String,Any}("speculate" => true))
+        @test r1.has_config
+        @test SQ.joovy_speculate_enabled()
+
+        r2 = Cfg._apply_prefs!(Dict{String,Any}("speculate" => false))
+        @test r2.has_config
+        @test !SQ.joovy_speculate_enabled()
+
+        r3 = Cfg._apply_prefs!(Dict{String,Any}("speculate" => "true"))
+        @test SQ.joovy_speculate_enabled()
+
+        r4 = Cfg._apply_prefs!(Dict{String,Any}("speculate" => "false"))
+        @test !SQ.joovy_speculate_enabled()
+
+        # An invalid value warns and is ignored -- speculation state is left as-is.
+        SQ.joovy_speculate!(true)
+        r5 = (@test_logs (:warn,) match_mode=:any Cfg._apply_prefs!(Dict{String,Any}(
+            "speculate" => "invalid"
+        )))
+        @test r5.has_config
+        @test SQ.joovy_speculate_enabled()   # unchanged by the ignored invalid value
+
+        SQ.joovy_speculate!(false)   # reset so later test files start with speculation off
+    end
+
     @testset "empty config is a clean no-op" begin
         _reset_tier_state!()
         r = Cfg._apply_prefs!(Dict{String,Any}())
