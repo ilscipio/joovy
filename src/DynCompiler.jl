@@ -12,6 +12,21 @@ const GLOBAL_CACHE = JoovyCache()
 
 const _compile_counter = Ref{Int}(0)
 
+# Set by the TypedInterp submodule (include-order forbids importing it here) to a
+# zero-argument function. Fired after every recompilation, because redefining a function
+# invalidates any typed IR cached against the old definition.
+const _cache_flush_hook = Ref{Any}(nothing)
+
+function _fire_cache_flush()
+    hook = _cache_flush_hook[]
+    hook === nothing && return nothing
+    try
+        hook()
+    catch
+    end
+    return nothing
+end
+
 abstract type AbstractJoovyCallable end
 
 struct JoovyCallable <: AbstractJoovyCallable
@@ -103,6 +118,7 @@ function joovy_recompile!(name::Symbol, code::String; mod::Module=Main)
     h = cache_put!(GLOBAL_CACHE, code, compiled_fn)
     cache_register!(GLOBAL_CACHE, name, code)
 
+    _fire_cache_flush()
     return compiled_fn
 end
 
@@ -114,6 +130,7 @@ function joovy_recompile!(name::Symbol, expr::Expr; mod::Module=Main)
     h = cache_put!(GLOBAL_CACHE, expr, compiled_fn)
     cache_register!(GLOBAL_CACHE, name, expr)
 
+    _fire_cache_flush()
     return compiled_fn
 end
 

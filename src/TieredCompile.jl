@@ -16,6 +16,25 @@ const _show_stats = Ref(get(ENV, "JULIA_IDE_JOOVY_STATS", "") == "1")
 # promoted function's callees at a higher tier too).
 const _on_promote_hook = Ref{Any}(nothing)
 
+# Set by the TypedInterp submodule (same include-order constraint as above) to a function
+# `fn -> callable`. When it is set, every NEW tier-0/tier-1 callable gets its raw function
+# wrapped in a typed-IR interpreter. Tier 2 is never wrapped -- native code already beats
+# any interpreter -- and `promote!` overwrites `tc.fn` with the native function, which
+# retires the wrapper on its own.
+const _typed_interp_hook = Ref{Any}(nothing)
+
+function _maybe_typed_interp(fn, tier::Int)
+    tier < 2 || return fn
+    hook = _typed_interp_hook[]
+    hook === nothing && return fn
+    wrapped = try
+        hook(fn)
+    catch
+        nothing
+    end
+    return wrapped === nothing ? fn : wrapped
+end
+
 # Lever: whether tier-1 injects @nospecialize on function arguments.
 # Default comes from the JULIA_IDE_JOOVY_NOSPECIALIZE env var (a "startup parameter"
 # you can pass when launching the IDE); toggle at runtime with set_nospecialize!.
@@ -180,7 +199,8 @@ end
 
 function make_tiered_callable(fn, tier::Int, code::String, name::Symbol,
                               mod::Module; promote_threshold::Int=10, owner=nothing)
-    TieredCallable(fn, tier, 0, code, name, promote_threshold, mod, false, ReentrantLock(), owner)
+    TieredCallable(_maybe_typed_interp(fn, tier), tier, 0, code, name,
+                   promote_threshold, mod, false, ReentrantLock(), owner)
 end
 
 # ===================================================================

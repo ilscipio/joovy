@@ -27,6 +27,7 @@ module Config
 import ..PackageTier
 import ..Instrument
 import ..SpecQueue
+import ..TypedInterp
 import TOML
 
 export joovy_apply_preferences!, joovy_config_status,
@@ -176,6 +177,13 @@ function _apply_prefs!(prefs::AbstractDict; fallback_tier::Union{Int,Nothing}=no
                 b === nothing ?
                     @warn("Joovy config: invalid value for `speculate`: $(repr(val)) (ignored)") :
                     SpecQueue.joovy_speculate!(b)
+                continue
+            end
+            if key == "typed_interp"
+                b = _parse_bool(val)
+                b === nothing ?
+                    @warn("Joovy config: invalid value for `typed_interp`: $(repr(val)) (ignored)") :
+                    TypedInterp.joovy_typed_interp!(b)
                 continue
             end
             t = _parse_tier(val)

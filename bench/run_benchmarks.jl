@@ -19,7 +19,8 @@ using Dates
 
 include(joinpath(@__DIR__, "common.jl"))
 
-const BENCH_SCRIPTS = ["bench_warmup.jl", "bench_reload.jl", "bench_speculative.jl"]
+const BENCH_SCRIPTS = ["bench_warmup.jl", "bench_reload.jl", "bench_speculative.jl",
+                       "bench_typed_interp.jl"]
 const RESULTS_DIR = joinpath(@__DIR__, "results")
 
 default_label() = Dates.format(now(), "yyyymmdd-HHMMSS")

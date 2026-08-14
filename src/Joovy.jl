@@ -9,6 +9,7 @@ include("HotSwap.jl")
 include("StaticCompile.jl")
 include("CompileTimeline.jl")
 include("TieredCompile.jl")
+include("TypedInterp.jl")
 include("MemoryManager.jl")
 include("LazyModule.jl")
 include("PackageTier.jl")
@@ -31,6 +32,7 @@ using .HotSwap
 using .StaticCompile
 using .CompileTimeline
 using .TieredCompile
+using .TypedInterp
 using .MemoryManager
 using .LazyModules
 using .Instrument
@@ -77,6 +79,11 @@ export CompileEvent, record_compile!, compile_timeline, compile_tree,
 export TieredCallable, joovy_compile_tiered, promote!, get_tier,
        set_promote_threshold!, tier_stats, set_module_tier!,
        make_tiered_callable, set_nospecialize!, nospecialize_enabled
+
+# TypedInterp
+export TypedInterpCallable, typed_interp_callable, typed_interp_enabled,
+       joovy_typed_interp!, typed_interp_stats, typed_interp_clear!,
+       typed_interp_inline, typed_interp_inline!
 
 # MemoryManager
 export cache_trim!, hotswap_trim_history!, source_map_gc!, joovy_memory_stats,

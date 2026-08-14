@@ -10,6 +10,21 @@ export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
 const _swap_guard_hooks = Function[]
 const _swap_guard_hooks_lock = ReentrantLock()
 
+# Set by the TypedInterp submodule (include-order forbids importing it here) to a
+# zero-argument function. Fired after a swap installs a new body, so no interpreter keeps
+# executing typed IR that was inferred from the retired definition.
+const _cache_flush_hook = Ref{Any}(nothing)
+
+function _fire_cache_flush()
+    hook = _cache_flush_hook[]
+    hook === nothing && return nothing
+    try
+        hook()
+    catch
+    end
+    return nothing
+end
+
 function _check_swap_guards(name::Symbol)
     lock(_swap_guard_hooks_lock) do
         for hook in _swap_guard_hooks
@@ -83,6 +98,7 @@ function hotswap_swap!(name::Symbol, new_code::String;
         push!(entry.history, entry.version => new_code)
     end
 
+    _fire_cache_flush()
     return new_compiled
 end
 
@@ -251,6 +267,9 @@ function hotswap_reload_file!(file::String;
                 push!(entry.history, entry.version => new_source)
             end
         end
+        # This path installs new bodies through `compile_expr_raw`, which never reaches
+        # `joovy_recompile!`, so it has to flush the typed-IR cache itself.
+        _fire_cache_flush()
     end
 
     return (reloaded=reloaded, unchanged=unchanged)
