@@ -3,6 +3,36 @@
 All notable changes to Joovy are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.4.0] - 2026-08-14
+
+### Added
+
+- `SourceProvider`: single choke point for user-source reads. The IDE pushes
+  editor buffers over IPC (`joovy/source_push`, `joovy/source_invalidate`) and
+  `joovy/reload` / `joovy/use` accept inline `content` and `version` params, so
+  a cached reload performs zero disk reads and always sees unsaved edits.
+- `CompileWatch`: a compile-time watchdog with 7 static rules -
+  `closure-arg-respecialization`, `vararg-unbounded-splat`,
+  `large-tuple-signature`, `untyped-global-in-fn`, `keyword-heavy-signature`,
+  `val-type-proliferation`, and `deep-nested-parametric-signature` - plus
+  Julia 1.12 dynamic inference metrics captured live. New IPC routes
+  `joovy/diag_start`, `joovy/diag_stop`, `joovy/diag_report`, and a streamed
+  `joovy/diagnostics` event. New `compile_watch` preference key.
+- New `bench/bench_source_cache.jl` and `bench/bench_compile_watch.jl`, wired
+  into `bench/run_benchmarks.jl` with pass/fail gates. Measured: source-cache
+  reload min 1.65x faster / 25 disk reads eliminated; compile-watch overhead
+  -3.2%; value fixture 5.39x compile-time reduction; incremental reload 6.96x
+  faster than a full reload.
+
+### Known limits
+
+- On Julia 1.12, the dynamic capture hook stops observing modules that were
+  tiered via compiler options.
+- An empty-string `content` param is treated as absent.
+- An experimental typed-IR interpreter lives on branch `typed-interp`.
+  Excluded from this release: the first-call latency gate failed. Steady-state
+  runs recorded 1.4-2.8x wins.
+
 ## [0.3.0] - 2026-07-31
 
 ### Added
