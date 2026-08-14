@@ -1,9 +1,11 @@
-# Tests for the CompileWatch submodule: SourcePos line tracking, the 7 static
+# Tests for the CompileWatch submodule: SourcePos line tracking, the 9 static
 # rules (true-positive AND false-positive fixture per rule, plus line
 # accuracy), compile_watch_check (both raw-code and file-path forms), and the
 # dynamic capture layer (capability probe + a real generated diagnostic) --
 # verified live against this repo's Julia 1.12.3, per the design's dynamic
-# layer table.
+# layer table. Also covers the `allocation-heavy-method` dynamic rule, which
+# reads Instrument's :full-mode per-call allocation tracking (Instrument.jl)
+# rather than the compile-time capture layer.
 #
 # Included BEFORE the mock_flexible_ipc.jl include (see test/runtests.jl) --
 # this file exercises the public Julia API directly, not IPC routes (that's
@@ -242,6 +244,145 @@ _cw_reset!() = CW._reset!()
         @test isempty(fp)
     end
 
+    @testset "rule: long-broadcast-fusion-chain" begin
+        _cw_reset!()
+        rid = Symbol("long-broadcast-fusion-chain")
+
+        # TP: a single statement chaining 9 dotted-operator calls (over the
+        # default threshold of 8).
+        tp_ops = compile_watch_check("""
+        function chain_ops(a,b,c,d,e,f,g,h,i,j)
+            a .+ b .* c .- d ./ e .^ f .+ g .* h .- i .+ j
+        end
+        """)
+        hits = filter(d -> d.rule_id === rid, tp_ops)
+        @test length(hits) == 1
+        @test hits[1].severity === :hint
+        @test hits[1].source === :static
+        @test hits[1].line == 2
+        @test hits[1].metric === nothing
+
+        # TP: `f.(args)` broadcast-call sugar chained past the threshold.
+        tp_dotcall = compile_watch_check("""
+        function chain_dotcall(a)
+            sin.(a) .+ cos.(a) .* tan.(a) .- exp.(a) ./ log.(a) .^ 2 .+ sqrt.(a) .- abs.(a) .+ a
+        end
+        """)
+        hits2 = filter(d -> d.rule_id === rid, tp_dotcall)
+        @test length(hits2) == 1
+
+        # TP: every call inside an `@.` macrocall counts as a fused op too.
+        tp_dotmacro = compile_watch_check("""
+        function chain_dotmacro(a,b,c,d,e,f,g,h,i,j)
+            @. a + b * c - d / e ^ f + g * h - i + j
+        end
+        """)
+        hits3 = filter(d -> d.rule_id === rid, tp_dotmacro)
+        @test length(hits3) == 1
+
+        # FP: field-access chains (`Expr(:., x, QuoteNode)`) are NOT broadcast
+        # calls and must never contribute to the count.
+        fp_field = compile_watch_check("""
+        function fieldchain(a)
+            a.b.c.d.e.f.g.h.i.j
+        end
+        """)
+        @test isempty(filter(d -> d.rule_id === rid, fp_field))
+
+        # FP: a short dot-chain (well under the threshold) must not fire.
+        fp_short = compile_watch_check("""
+        function shortchain(a, b, c)
+            a .+ b .* c
+        end
+        """)
+        @test isempty(filter(d -> d.rule_id === rid, fp_short))
+
+        # Config-overridable threshold: lowering it makes the short chain fire.
+        compile_watch_set_thresholds!(broadcast_fusion_chain_over=1)
+        tp_lowered = compile_watch_check("""
+        function shortchain2(a, b, c)
+            a .+ b .* c
+        end
+        """)
+        @test length(filter(d -> d.rule_id === rid, tp_lowered)) == 1
+        compile_watch_set_thresholds!(broadcast_fusion_chain_over=8)
+        _cw_reset!()
+    end
+
+    @testset "rule: int-init-float-accumulator" begin
+        _cw_reset!()
+        rid = Symbol("int-init-float-accumulator")
+
+        # TP (a): compound-assigned with an expression containing a float literal.
+        tp_a = compile_watch_check("""
+        function acc_compound_float(n)
+            k3 = 0
+            for i in 1:n
+                k3 += i * 1.5
+            end
+            k3
+        end
+        """)
+        hits_a = filter(d -> d.rule_id === rid, tp_a)
+        @test length(hits_a) == 1
+        @test hits_a[1].severity === :hint
+        @test hits_a[1].source === :static
+        @test hits_a[1].line == 2   # reported at the init line, not the promotion site
+        @test hits_a[1].metric === nothing
+
+        # TP (b): plain assignment via division.
+        tp_b1 = compile_watch_check("""
+        function acc_division(n)
+            k = 0
+            k = k / n
+            k
+        end
+        """)
+        @test length(filter(d -> d.rule_id === rid, tp_b1)) == 1
+
+        # TP (b): compound-assigned via `/=`.
+        tp_b2 = compile_watch_check("""
+        function acc_div_compound(n)
+            k = 0
+            k /= n
+            k
+        end
+        """)
+        @test length(filter(d -> d.rule_id === rid, tp_b2)) == 1
+
+        # TP (c): reassigned to a bare float literal.
+        tp_c = compile_watch_check("""
+        function acc_float_lit(n)
+            k = 0
+            k = 2.0
+            k
+        end
+        """)
+        @test length(filter(d -> d.rule_id === rid, tp_c)) == 1
+
+        # FP: a plain int accumulator that stays int must never fire.
+        fp = compile_watch_check("""
+        function acc_int_only(n)
+            x = 0
+            for i in 1:n
+                x += 1
+            end
+            x
+        end
+        """)
+        @test isempty(filter(d -> d.rule_id === rid, fp))
+
+        # FP: an unrelated int local with no later reassignment at all.
+        fp2 = compile_watch_check("""
+        function acc_no_reassign(n)
+            x = 0
+            x
+        end
+        """)
+        @test isempty(filter(d -> d.rule_id === rid, fp2))
+        _cw_reset!()
+    end
+
     # =====================================================================
     # 3. compile_watch_check: both entry-point forms
     # =====================================================================
@@ -359,6 +500,71 @@ _cw_reset!() = CW._reset!()
         compile_watch_stop!()
         compile_watch_set_thresholds!(specializations_over=32, inference_self_ms_over=50.0,
                                       reinfer_count_over=3)
+        _cw_reset!()
+    end
+
+    @testset "dynamic layer: allocation-heavy-method (Instrument :full mode)" begin
+        _cw_reset!()
+        Joovy.reset_counters!()
+        compile_watch_set_thresholds!(alloc_bytes_per_call_over=1000)
+        result = compile_watch_start!(static=false, dynamic=true)
+
+        if result.dynamic_active
+            # A vectorized chain of SEPARATE broadcast statements: each line
+            # (b, c, d, e) allocates its own full intermediate array before
+            # the next step even starts -- the study's "non-fused vectorized
+            # chains allocate an intermediate per step" pattern.
+            tmpfile = joinpath(_cwtest_dir, "scripts", "_cw_alloc_chain.jl")
+            write(tmpfile, """
+            function cw_alloc_chain_fn(n)
+                a = ones(n, n)
+                b = a .* 2.0
+                c = b .+ 1.0
+                d = sqrt.(c)
+                e = d .- 0.5
+                return e
+            end
+            """)
+            code = read(tmpfile, String)
+            Joovy.joovy_exec(code; instrument=:full, path=tmpfile)
+            for _ in 1:5
+                Base.invokelatest(Base.invokelatest(getfield, Main, :cw_alloc_chain_fn), 50)
+            end
+
+            diags = compile_watch_report()
+            hit = filter(d -> d.rule_id === Symbol("allocation-heavy-method") &&
+                              d.method_name === :cw_alloc_chain_fn, diags)
+            @test !isempty(hit)
+            if !isempty(hit)
+                d = hit[1]
+                @test d.severity === :warning
+                @test d.source === :dynamic
+                @test d.file == abspath(tmpfile)
+                @test d.line == 1
+                @test d.metric !== nothing
+                @test haskey(d.metric, "bytes_per_call")
+                @test haskey(d.metric, "calls")
+                @test d.metric["calls"] == 5
+                @test d.metric["bytes_per_call"] > 1000
+            end
+            rm(tmpfile; force=true)
+
+            # FP: a non-allocating function must not fire, even instrumented
+            # and called the same way.
+            Joovy.joovy_exec("cw_alloc_noalloc_fn(x) = x + 1\n"; instrument=:full)
+            for _ in 1:5
+                Base.invokelatest(Base.invokelatest(getfield, Main, :cw_alloc_noalloc_fn), 1)
+            end
+            diags2 = compile_watch_report()
+            @test isempty(filter(d -> d.rule_id === Symbol("allocation-heavy-method") &&
+                                      d.method_name === :cw_alloc_noalloc_fn, diags2))
+        else
+            @info "CompileWatch: dynamic capability unavailable in this test run -- allocation-heavy-method not exercised" VERSION
+        end
+
+        compile_watch_stop!()
+        compile_watch_set_thresholds!(alloc_bytes_per_call_over=1_000_000)
+        Joovy.reset_counters!()
         _cw_reset!()
     end
 

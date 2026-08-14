@@ -5,7 +5,7 @@
 #
 # Two independent detection layers:
 #
-#   STATIC  -- 7 AST-level pattern rules (section 2 of the design), run once
+#   STATIC  -- 9 AST-level pattern rules (section 2 of the design), run once
 #              per requested file (`compile_watch_start!(paths=...)`) or
 #              ad-hoc over raw source/a path (`compile_watch_check`). Zero
 #              runtime dependency; reused across `compile_watch_check` calls
@@ -31,6 +31,7 @@ using ..SourceProvider
 using ..SourcePos
 using ..LazyModules
 using ..Config
+import ..Instrument
 
 export CWDiagnostic, compile_watch_start!, compile_watch_stop!, compile_watch_report,
        compile_watch_check, compile_watch_set_thresholds!, compile_watch_wire_snapshot,
@@ -99,6 +100,7 @@ const _running = Ref{Bool}(false)
 
 const _static_diagnostics = Dict{String,Vector{CWDiagnostic}}()   # path -> diags
 const _dynamic_diagnostics = Dict{Method,CWDiagnostic}()          # method -> latest diag
+const _alloc_diagnostics = Dict{Symbol,CWDiagnostic}()            # fn name -> latest allocation-heavy-method diag
 
 const _dirty = Ref{Bool}(false)
 const _stream_started = Ref{Bool}(false)
@@ -128,35 +130,46 @@ mutable struct _Thresholds
     specializations_over::Int
     inference_self_ms_over::Float64
     reinfer_count_over::Int
+    broadcast_fusion_chain_over::Int   # static: long-broadcast-fusion-chain
+    alloc_bytes_per_call_over::Int     # dynamic: allocation-heavy-method
 end
-const _thresholds = Ref(_Thresholds(32, 50.0, 3))
+const _thresholds = Ref(_Thresholds(32, 50.0, 3, 8, 1_000_000))
 
 """
     compile_watch_set_thresholds!(; specializations_over=nothing,
                                     inference_self_ms_over=nothing,
-                                    reinfer_count_over=nothing)
+                                    reinfer_count_over=nothing,
+                                    broadcast_fusion_chain_over=nothing,
+                                    alloc_bytes_per_call_over=nothing)
 
-Override one or more dynamic-layer thresholds (defaults: 32 specializations,
-50ms self-inference time, 3 re-inferences). Only provided keys change; `nothing`
-(the default for each) leaves that threshold as-is. Returns the resulting
+Override one or more thresholds (defaults: 32 specializations, 50ms
+self-inference time, 3 re-inferences, 8 fused broadcast ops per statement,
+1_000_000 allocated bytes/call). Only provided keys change; `nothing` (the
+default for each) leaves that threshold as-is. Returns the resulting
 threshold set.
 """
 function compile_watch_set_thresholds!(; specializations_over::Union{Integer,Nothing}=nothing,
                                         inference_self_ms_over::Union{Real,Nothing}=nothing,
-                                        reinfer_count_over::Union{Integer,Nothing}=nothing)
+                                        reinfer_count_over::Union{Integer,Nothing}=nothing,
+                                        broadcast_fusion_chain_over::Union{Integer,Nothing}=nothing,
+                                        alloc_bytes_per_call_over::Union{Integer,Nothing}=nothing)
     t = _thresholds[]
     specializations_over === nothing || (t.specializations_over = Int(specializations_over))
     inference_self_ms_over === nothing || (t.inference_self_ms_over = Float64(inference_self_ms_over))
     reinfer_count_over === nothing || (t.reinfer_count_over = Int(reinfer_count_over))
+    broadcast_fusion_chain_over === nothing || (t.broadcast_fusion_chain_over = Int(broadcast_fusion_chain_over))
+    alloc_bytes_per_call_over === nothing || (t.alloc_bytes_per_call_over = Int(alloc_bytes_per_call_over))
     return (specializations_over = t.specializations_over,
             inference_self_ms_over = t.inference_self_ms_over,
-            reinfer_count_over = t.reinfer_count_over)
+            reinfer_count_over = t.reinfer_count_over,
+            broadcast_fusion_chain_over = t.broadcast_fusion_chain_over,
+            alloc_bytes_per_call_over = t.alloc_bytes_per_call_over)
 end
 
 # ===================================================================
 # Static rules (design section 2): AST-only pattern detectors.
 #
-# All 7 rules operate on a `_FuncDef` (one named function definition, found by
+# All 9 rules operate on a `_FuncDef` (one named function definition, found by
 # reusing LazyModules' def helpers -- `_is_function_def` / `_extract_def_name`
 # -- exactly like the rest of the repo splits definitions out of parsed
 # source) plus, for untyped-global-in-fn, a same-file top-level name
@@ -172,7 +185,7 @@ end
 
 # Unwrap `@inline function f() ... end` (and any other macro decorating a
 # def, possibly stacked) down to the underlying function-def Expr, so a
-# decorated top-level function is both (a) analyzed by the 7 static rules
+# decorated top-level function is both (a) analyzed by the 9 static rules
 # itself, and (b) recognized as a resolvable same-file name when OTHER
 # functions call it (see `_scan_toplevel!`) -- `LazyModules._is_function_def`
 # only matches the def shape directly, not a `:macrocall` wrapping one.
@@ -794,6 +807,203 @@ function _rule_nested(fd::_FuncDef, path::String)::Vector{CWDiagnostic}
     return CWDiagnostic[]
 end
 
+# --- rule 8: long-broadcast-fusion-chain ------------------------------------
+#
+# From the performance study: a single statement chaining many `.`-fused
+# broadcast operations together builds one deeply nested `Broadcasted{...}`
+# parametric type -- inference/codegen cost grows with chain depth even
+# though (unlike a NON-fused chain of separate statements) the runtime
+# allocates only the final output. Three fused-op shapes count towards one
+# statement's total:
+#   - a dotted-operator call:  `Expr(:call, sym, ...)` where `sym` is a
+#     Symbol whose name starts with '.' (`.+`, `.*`, `.^`, `.<=`, ...)
+#   - `f.(args)` broadcast-call sugar: `Expr(:., f, Expr(:tuple, args...))`
+#     -- excludes plain field access `Expr(:., x, QuoteNode(:prop))`, which
+#     has the SAME head but a QuoteNode second arg instead of a tuple.
+#   - every `:call` node textually inside an `@.` (`@__dot__`) macrocall --
+#     `@.` rewrites EVERY call/operator in its body to its dotted form, so
+#     none of them carry an explicit leading '.' in the raw (unlowered) AST.
+
+const _RULE_BROADCAST_CHAIN = Symbol("long-broadcast-fusion-chain")
+
+function _is_dotted_op_call(node)::Bool
+    (node isa Expr && node.head === :call && length(node.args) >= 1) || return false
+    callee = node.args[1]
+    callee isa Symbol || return false
+    s = String(callee)
+    return !isempty(s) && s[1] == '.'
+end
+
+# `f.(args)` form -- same head as field access (`x.prop`), distinguished only
+# by the second arg's shape: a QuoteNode (field name) for field access vs an
+# `Expr(:tuple, ...)` (call arguments) for the broadcast-call form.
+function _is_dot_call_form(node)::Bool
+    (node isa Expr && node.head === :(.) && length(node.args) == 2) || return false
+    return !(node.args[2] isa QuoteNode)
+end
+
+function _is_dot_macro(node)::Bool
+    (node isa Expr && node.head === :macrocall && length(node.args) >= 1) || return false
+    return node.args[1] === Symbol("@__dot__")
+end
+
+# Counts every fused-op node in `node`'s subtree, scoped to ONE statement:
+# stops descending at a nested `:block` (a control-flow body's statements are
+# each counted separately as their OWN statement -- see
+# `_collect_fusion_statements!`) but otherwise recurses through everything,
+# including non-fusing call boundaries (`f(a .+ b)` still counts the `.+`),
+# since the rule counts "fused ops appearing in this statement", not a
+# strict single-Broadcasted-tree membership analysis.
+function _count_fused_in_scope(node, in_dot::Bool)::Int
+    node isa Expr || return 0
+    node.head === :block && return 0
+    if _is_dot_macro(node)
+        total = 0
+        for a in node.args[3:end]
+            total += _count_fused_in_scope(a, true)
+        end
+        return total
+    end
+    is_fused = in_dot ? (node.head === :call) : (_is_dotted_op_call(node) || _is_dot_call_form(node))
+    total = is_fused ? 1 : 0
+    for a in node.args
+        total += _count_fused_in_scope(a, in_dot)
+    end
+    return total
+end
+
+# Collects "statement root" nodes: every direct entry of every `:block`
+# reachable in `node` (the outer function body block, and any nested block
+# from an if/for/while/try/let/do body), paired with its line. A `:block`
+# itself is transparent -- its entries are the statements, not the block
+# node -- so counting each entry's fused ops via `_count_fused_in_scope`
+# (which stops at the NEXT nested `:block`) never double-counts a nested
+# statement as part of its parent's total.
+function _collect_fusion_statements!(node, cursor::Ref{Int}, out::Vector{Tuple{Any,Int}})
+    if node isa LineNumberNode
+        cursor[] = node.line
+        return nothing
+    end
+    node isa Expr || return nothing
+    if node.head === :block
+        for a in node.args
+            if a isa LineNumberNode
+                cursor[] = a.line
+            elseif a isa Expr
+                push!(out, (a, cursor[]))
+                _collect_fusion_statements!(a, cursor, out)   # find blocks nested inside this statement
+            end
+        end
+        return nothing
+    end
+    for a in node.args
+        _collect_fusion_statements!(a, cursor, out)
+    end
+    return nothing
+end
+
+function _rule_broadcast_chain(fd::_FuncDef, path::String)::Vector{CWDiagnostic}
+    out = CWDiagnostic[]
+    stmts = Tuple{Any,Int}[]
+    _collect_fusion_statements!(fd.body, Ref(fd.line), stmts)
+    thresh = _thresholds[].broadcast_fusion_chain_over
+    for (node, line) in stmts
+        cnt = _count_fused_in_scope(node, false)
+        cnt > thresh || continue
+        push!(out, CWDiagnostic(_RULE_BROADCAST_CHAIN, :hint, path, line, fd.name,
+            "A statement in `$(fd.name)` fuses $(cnt) dotted broadcast operations together (over $(thresh)) -- deeply nested Broadcasted type; inference and codegen cost grow with chain depth.",
+            "Split the chain or use an explicit loop (a loop also avoids the intermediate allocations that splitting reintroduces).",
+            :static, nothing))
+    end
+    return out
+end
+
+# --- rule 9: int-init-float-accumulator -------------------------------------
+#
+# From the performance study: `k3 = 0` (an Int-literal init) later promoted
+# to float caused 9.44M allocations -- the accumulator's inferred type widens
+# from `Int` to `Union{Int,Float64}`/`Float64` partway through the function,
+# boxing every subsequent use. Deliberately narrow (only 3 easily-checked,
+# AST-visible promotion shapes -- see the task brief) to keep this at zero
+# false positives on ordinary code: a plain `x = 0; x += 1` (int accumulator
+# that STAYS int) must never fire.
+const _RULE_INT_FLOAT_ACC = Symbol("int-init-float-accumulator")
+
+const _COMPOUND_ASSIGN_HEADS = Set{Symbol}([
+    :+=, :-=, :*=, :/=, :÷=, :\=, :^=, :%=, ://=,
+    :|=, :&=, :⊻=, :<<=, :>>=, :>>>=,
+])
+
+function _contains_float_lit(node)::Bool
+    node isa AbstractFloat && return true
+    node isa Expr || return false
+    for a in node.args
+        _contains_float_lit(a) && return true
+    end
+    return false
+end
+
+function _contains_division(node)::Bool
+    node isa Expr || return false
+    if node.head === :call && length(node.args) >= 1 && node.args[1] === :/
+        return true
+    end
+    for a in node.args
+        _contains_division(a) && return true
+    end
+    return false
+end
+
+function _rule_int_float_acc(fd::_FuncDef, path::String)::Vector{CWDiagnostic}
+    out = CWDiagnostic[]
+
+    # Pass 1: candidate int-inits -- `x = <Integer literal>` (Bool excluded;
+    # `Bool <: Integer` but `flag = false` is not an accumulator init). First
+    # occurrence per name wins, matching this rule's flat-body over-approximation
+    # (same convention as `_collect_locals`/`_rule_untyped_global`).
+    inits = Dict{Symbol,Int}()
+    SourcePos.each_positioned(fd.body) do node, line
+        (node isa Expr && node.head === :(=) && length(node.args) == 2) || return nothing
+        lhs = node.args[1]
+        lhs isa Symbol || return nothing
+        rhs = node.args[2]
+        (rhs isa Integer && !(rhs isa Bool)) || return nothing
+        haskey(inits, lhs) || (inits[lhs] = line)
+        return nothing
+    end
+    isempty(inits) && return out
+
+    # Pass 2: a later assignment/compound-assignment to the SAME name that
+    # promotes it to float, via one of the three narrow shapes.
+    flagged = Set{Symbol}()
+    SourcePos.each_positioned(fd.body) do node, line
+        node isa Expr || return nothing
+        head = node.head
+        is_compound = head in _COMPOUND_ASSIGN_HEADS
+        is_plain = head === :(=)
+        (is_compound || is_plain) && length(node.args) == 2 || return nothing
+        lhs = node.args[1]
+        lhs isa Symbol || return nothing
+        haskey(inits, lhs) || return nothing
+        lhs in flagged && return nothing
+        line > inits[lhs] || return nothing   # must be strictly after the init
+
+        rhs = node.args[2]
+        fires = (is_compound && _contains_float_lit(rhs)) ||             # (a)
+                head === :(/=) || _contains_division(rhs) ||             # (b)
+                (is_plain && rhs isa AbstractFloat)                      # (c)
+        fires || return nothing
+
+        push!(flagged, lhs)
+        push!(out, CWDiagnostic(_RULE_INT_FLOAT_ACC, :hint, path, inits[lhs], fd.name,
+            "`$(lhs)` in `$(fd.name)` is initialized from an integer literal but later promoted to float -- inference widens and the accumulator boxes.",
+            "Initialize with 0.0 or zero(T); verify with @code_warntype.",
+            :static, nothing))
+        return nothing
+    end
+    return out
+end
+
 # --- orchestrator ------------------------------------------------------------
 
 function _run_static_rules(ast, path::String, mod::Module)::Vector{CWDiagnostic}
@@ -807,6 +1017,8 @@ function _run_static_rules(ast, path::String, mod::Module)::Vector{CWDiagnostic}
         append!(out, _rule_kwargs(fd, path))
         append!(out, _rule_val(fd, path))
         append!(out, _rule_nested(fd, path))
+        append!(out, _rule_broadcast_chain(fd, path))
+        append!(out, _rule_int_float_acc(fd, path))
     end
     return out
 end
@@ -816,7 +1028,7 @@ end
 
 Static-only, one-shot check: `path_or_code` is treated as a file path if it
 names an existing file (read via `SourceProvider.source_read`, so a pushed
-editor buffer is honoured), otherwise as raw Julia source. Runs all 7 static
+editor buffer is honoured), otherwise as raw Julia source. Runs all 9 static
 rules and returns the diagnostics directly -- no session state, safe to call
 repeatedly with no `compile_watch_start!`/`compile_watch_stop!` bracket.
 """
@@ -1119,18 +1331,70 @@ function _refresh_dynamic_diagnostics!()
     return nothing
 end
 
+# --- allocation-heavy-method: reads Instrument's :full per-call byte deltas -
+
+const _RULE_ALLOC_HEAVY = Symbol("allocation-heavy-method")
+
+# Reads `Instrument.alloc_snapshot()` (accumulated by the `:full`-instrumentation
+# `record` overload -- see Instrument.jl) and turns any function averaging over
+# `alloc_bytes_per_call_over` bytes/call into a diagnostic. Keyed by function
+# NAME rather than `Method` (unlike the compile-time rules above): Instrument
+# tracks plain top-level defs by name, not by resolved Method object, so
+# there is no Method to key on here.
+function _refresh_alloc_diagnostics!()
+    snap = try
+        Instrument.alloc_snapshot()
+    catch
+        return nothing
+    end
+    isempty(snap) && return nothing
+    th = _thresholds[]
+    changed = false
+    for entry in snap
+        entry.file === nothing && continue
+        entry.calls > 0 || continue
+        bytes_per_call = entry.total_alloc_bytes / entry.calls
+        if bytes_per_call > th.alloc_bytes_per_call_over
+            metric = Dict{String,Any}(
+                "bytes_per_call" => round(bytes_per_call; digits=1),
+                "calls"          => entry.calls,
+            )
+            d = CWDiagnostic(_RULE_ALLOC_HEAVY, :warning, entry.file, entry.line, entry.name,
+                "`$(entry.name)` allocates $(round(bytes_per_call; digits=1)) bytes/call on average (over $(th.alloc_bytes_per_call_over)) across $(entry.calls) recorded calls.",
+                "Check for intermediate arrays from non-fused vectorized chains and type-unstable accumulators; use in-place .=/@., pre-allocated outputs, and @code_warntype. Concurrent tasks make this per-call figure approximate.",
+                :dynamic, metric)
+            lock(_session_lock) do
+                _alloc_diagnostics[entry.name] = d
+            end
+            changed = true
+        else
+            lock(_session_lock) do
+                haskey(_alloc_diagnostics, entry.name) || return nothing
+                delete!(_alloc_diagnostics, entry.name)
+                changed = true
+            end
+        end
+    end
+    changed && (_dirty[] = true)
+    return nothing
+end
+
 function _maybe_drain_and_refresh!()
     _dynamic_active[] || return nothing
     @static if VERSION >= v"1.12-"
         items = _drain_1_12!()
-        isempty(items) && return nothing
-        _process_1_12!(items)
+        if !isempty(items)
+            _process_1_12!(items)
+            _refresh_dynamic_diagnostics!()
+        end
     else
         samples = _drain_legacy!()
-        isempty(samples) && return nothing
-        _process_legacy!(samples)
+        if !isempty(samples)
+            _process_legacy!(samples)
+            _refresh_dynamic_diagnostics!()
+        end
     end
-    _refresh_dynamic_diagnostics!()
+    _refresh_alloc_diagnostics!()
     return nothing
 end
 
@@ -1178,7 +1442,7 @@ end
 
 Start (or reconfigure) a CompileWatch session.
 
-`static`, if true, runs all 7 static rules over every file in `paths` right
+`static`, if true, runs all 9 static rules over every file in `paths` right
 away. `dynamic`, if true, installs the dynamic capture layer and runs a
 capability probe; on failure (e.g. an unsupported Julia build) it downgrades
 to static-only with a warning rather than silently claiming coverage it
@@ -1255,6 +1519,9 @@ function compile_watch_report()::Vector{CWDiagnostic}
         for v in values(_dynamic_diagnostics)
             push!(diags, v)
         end
+        for v in values(_alloc_diagnostics)
+            push!(diags, v)
+        end
         sort!(diags; by = d -> (d.file, d.line, string(d.rule_id)))
         return diags
     end
@@ -1286,11 +1553,12 @@ function _reset!()
         _running[] = false
         empty!(_static_diagnostics)
         empty!(_dynamic_diagnostics)
+        empty!(_alloc_diagnostics)
         empty!(_method_agg)
         empty!(_touched_methods)
     end
     _dirty[] = false
-    _thresholds[] = _Thresholds(32, 50.0, 3)
+    _thresholds[] = _Thresholds(32, 50.0, 3, 8, 1_000_000)
     return nothing
 end
 

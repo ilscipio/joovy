@@ -28,7 +28,7 @@ import ..ColdLoad
 using ..CompileTimeline
 
 export CounterEntry, joovy_exec, instrument_expr, counters_report,
-       start_counter_stream!, reset_counters!
+       start_counter_stream!, reset_counters!, alloc_snapshot
 
 const _MAX_SAMPLES = 256
 const _PROMOTE_THRESHOLD = Ref{Int}(10)
@@ -46,10 +46,14 @@ mutable struct CounterEntry
     tier::Int
     level::Symbol
     promoting::Bool
+    total_alloc_bytes::UInt64    # :full only -- sum of per-call Base.gc_num() deltas
+    file::Union{Nothing,String}  # absolute path of the def's source, if known
+    def_line::Int                # 1-based line of the def's body, 0 if unknown
 end
 
 CounterEntry(name::Symbol, level::Symbol, tier::Int) =
-    CounterEntry(name, 0, UInt64(0), Vector{UInt64}(undef, _MAX_SAMPLES), 0, 0, tier, level, false)
+    CounterEntry(name, 0, UInt64(0), Vector{UInt64}(undef, _MAX_SAMPLES), 0, 0, tier, level, false,
+                 UInt64(0), nothing, 0)
 
 const _COUNTERS = Dict{Symbol, CounterEntry}()
 const _COUNTERS_LOCK = ReentrantLock()
@@ -88,6 +92,35 @@ end
     return nothing
 end
 
+# Same-shape overload used by :full instrumentation, additionally given the
+# `Base.gc_num()` snapshot taken right before the wrapped body ran. The
+# allocated-bytes delta is computed exactly the way `Base.@allocated` computes
+# it pre-1.12 (and the way `@time`/`@timed` still compute it on 1.12): a
+# `Base.GC_Diff` of the gc counters before/after, `.allocd` field. This is a
+# PROCESS-WIDE counter, not a per-task one, so a call that overlaps another
+# task's allocations on the same thread has its delta polluted by that other
+# task's bytes too -- an inherent limitation of this mechanism (documented at
+# the CompileWatch `allocation-heavy-method` rule that consumes this data),
+# not something a cheaper capture point can fix without switching to Julia
+# 1.12's newer per-task `Base.gc_bytes` counter (a bigger, riskier change than
+# this task calls for).
+# @noinline is load-bearing: inlining this body (GC_Diff = ~15 field
+# subtractions) into every :full-instrumented def made each hot-reload
+# re-eval re-infer and re-codegen it, slowing incremental reload ~4x.
+@noinline function record(e::CounterEntry, t0::UInt64, gc0::Base.GC_Num)
+    dt = time_ns() - t0
+    e.total_ns += dt
+    p = e.sample_pos % _MAX_SAMPLES + 1
+    @inbounds e.samples[p] = dt
+    e.sample_pos = p
+    e.sample_n < _MAX_SAMPLES && (e.sample_n += 1)
+    gdiff = Base.GC_Diff(Base.gc_num(), gc0)
+    bytes = gdiff.allocd
+    bytes > 0 && (e.total_alloc_bytes += UInt64(bytes))
+    tick(e)
+    return nothing
+end
+
 # ===================================================================
 # AST body-transform (structure mirrors TieredCompile._add_nospecialize)
 # Only the function BODY is rewritten; the signature is never touched, so
@@ -118,11 +151,13 @@ function _wrap_body(old_body, e::CounterEntry, level::Symbol)
         return Expr(:block, tick_call, old_body)
     else
         tsym = gensym(:joovy_t0)
+        gcsym = gensym(:joovy_gc0)
         t0_assign = Expr(:(=), tsym, Expr(:call, GlobalRef(Base, :time_ns)))
-        rec_call = Expr(:call, GlobalRef(@__MODULE__, :record), e, tsym)
+        gc0_assign = Expr(:(=), gcsym, Expr(:call, GlobalRef(Base, :gc_num)))
+        rec_call = Expr(:call, GlobalRef(@__MODULE__, :record), e, tsym, gcsym)
         # value of `try A finally B end` is the value of A → return value preserved
         try_expr = Expr(:try, old_body, false, false, Expr(:block, rec_call))
-        return Expr(:block, t0_assign, try_expr)
+        return Expr(:block, t0_assign, gc0_assign, try_expr)
     end
 end
 
@@ -195,8 +230,10 @@ function joovy_exec(code::AbstractString; mod::Module=Main, tier::Int=1,
     lower = tier < 2
     top = Expr(:toplevel)
     defnames = Symbol[]
+    cur_line = 1   # cursor over toplevel LineNumberNode siblings, for CounterEntry.def_line
     for stmt in stmts
         if stmt isa LineNumberNode
+            cur_line = stmt.line
             push!(top.args, stmt)
             continue
         end
@@ -224,7 +261,9 @@ function joovy_exec(code::AbstractString; mod::Module=Main, tier::Int=1,
                 t isa Int && (this_tier = t)
             end
             this_lower = this_tier < 2
-            entry = _register_def!(name, stmt, this_tier, instrument)
+            entry = _register_def!(name, stmt, this_tier, instrument;
+                                   file=path === nothing ? nothing : abspath(String(path)),
+                                   line=cur_line)
             if this_lower
                 push!(top.args, Meta.parse("Base.Experimental.@optlevel 0"))
             end
@@ -267,7 +306,8 @@ function joovy_exec(code::AbstractString; mod::Module=Main, tier::Int=1,
     return result
 end
 
-function _register_def!(name::Symbol, stmt::Expr, tier::Int, level::Symbol)
+function _register_def!(name::Symbol, stmt::Expr, tier::Int, level::Symbol;
+                        file::Union{Nothing,String}=nothing, line::Int=0)
     lock(_COUNTERS_LOCK) do
         e = get(_COUNTERS, name, nothing)
         if e === nothing
@@ -278,6 +318,8 @@ function _register_def!(name::Symbol, stmt::Expr, tier::Int, level::Symbol)
             e.tier = tier
             e.promoting = false
         end
+        e.file = file
+        e.def_line = line
         srcs = get!(() -> Expr[], _SOURCE, name)
         push!(srcs, stmt)
         return e
@@ -342,6 +384,37 @@ function counters_report()
         end
     end
     return Dict{String,Any}("functions" => fns)
+end
+
+"""
+    alloc_snapshot() -> Vector{NamedTuple}
+
+Per-function allocation snapshot consumed by CompileWatch's dynamic layer
+(the `allocation-heavy-method` rule): one `(name, file, line, calls,
+total_alloc_bytes)` entry per `:full`-instrumented function that has recorded
+at least one call. `file`/`line` come from the def's own source location
+(set in `_register_def!`), `nothing`/`0` if unknown (e.g. `joovy_exec` was
+called with no `path`) -- CompileWatch skips entries with no file, mirroring
+how the compile-time dynamic rules skip methods `_method_loc` can't resolve.
+
+`total_alloc_bytes` is a sum of per-call `Base.gc_num()` deltas (see
+`record`'s `:full` overload) -- a PROCESS-WIDE counter, so calls from
+concurrently-running tasks inflate each other's totals. `bytes_per_call`
+derived from this is therefore an approximation, not an exact per-call
+figure, under concurrency.
+"""
+function alloc_snapshot()
+    T = @NamedTuple{name::Symbol, file::Union{Nothing,String}, line::Int, calls::Int, total_alloc_bytes::UInt64}
+    out = T[]
+    lock(_COUNTERS_LOCK) do
+        for (name, e) in _COUNTERS
+            e.level === :full || continue
+            e.call_count > 0 || continue
+            push!(out, (name = name, file = e.file, line = e.def_line,
+                        calls = e.call_count, total_alloc_bytes = e.total_alloc_bytes))
+        end
+    end
+    return out
 end
 
 function _send_counters()
