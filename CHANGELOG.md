@@ -3,6 +3,42 @@
 All notable changes to Joovy are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.4.1] - 2026-08-14
+
+### Added
+
+- Two static CompileWatch rules from the classic Julia vectorization study:
+  `long-broadcast-fusion-chain` (more than 8 fused dot operations in one
+  statement build a deeply nested `Broadcasted` type whose inference cost
+  grows with depth) and `int-init-float-accumulator` (an integer-literal
+  init later promoted to float widens inference and boxes the accumulator).
+- Dynamic rule `allocation-heavy-method`: `Instrument`'s `:full` mode now
+  records a per-call allocated-bytes delta (`Instrument.alloc_snapshot()`),
+  and CompileWatch flags functions above `alloc_bytes_per_call_over`
+  (default 1000000 bytes/call). Suggestion text covers non-fused vectorized
+  chains and type-unstable accumulators. Overhead on instrumented calls:
+  ~0.6% measured.
+- Deterministic allocation benchmark: the study's vectorized-chain vs loop
+  fixture, gated at >= 10x allocation reduction (measured 12.02x), plus a
+  gate that the chain fixture is flagged by `long-broadcast-fusion-chain`.
+- New config thresholds `broadcast_fusion_chain_over` (default 8) and
+  `alloc_bytes_per_call_over` (default 1000000).
+
+### Changed
+
+- The compile-watch overhead gate now measures the in-process per-call cost
+  of the `:full` record path against an identical plain call (measured
+  ~90 ns/call, gated at 2000 ns). The old child-process wall-clock
+  comparison swung -16.8%..+11.5% between identical runs and is kept as a
+  reporting-only metric.
+
+### Fixed
+
+- The new allocation-recording overload is `@noinline`: inlining its
+  `GC_Diff` arithmetic into every instrumented definition made each
+  hot-reload re-evaluation re-infer it, slowing incremental reload ~4x.
+  Caught by the reload bench gate before release.
+
 ## [0.4.0] - 2026-08-14
 
 ### Added
