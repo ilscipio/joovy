@@ -137,6 +137,41 @@ call_diag(route::String, params::Dict) = FIPC2.call(route, params)
         Joovy.CompileWatch._reset!()
     end
 
+    # =====================================================================
+    # 6. as-you-type: joovy/source_push re-scans while a session runs
+    # =====================================================================
+    @testset "source_push triggers static rescan" begin
+        push_path = joinpath(_cwipc_dir, "scripts", "_cwipc_push_only.jl")
+        isfile(push_path) && rm(push_path)   # never on disk: pushed text only
+
+        r = call_diag("diag_start", Dict{String,Any}("static" => true, "dynamic" => false))
+        @test r["status"] == "ok"
+
+        bad = "function cwipc_push_fn(cb, x)\n    cb(x) + 1\nend\n"
+        r = FIPC2.call("source_push",
+                       Dict{String,Any}("path" => push_path, "content" => bad))
+        @test r["status"] == "ok"
+        diags = call_diag("diag_report", Dict{String,Any}())["diagnostics"]
+        @test any(d -> d["file"] == abspath(push_path) &&
+                       d["rule_id"] == "closure-arg-respecialization", diags)
+
+        good = "cwipc_push_fn(x) = x + 1\n"
+        r = FIPC2.call("source_push",
+                       Dict{String,Any}("path" => push_path, "content" => good, "version" => 2))
+        @test r["status"] == "ok"
+        diags = call_diag("diag_report", Dict{String,Any}())["diagnostics"]
+        @test !any(d -> d["file"] == abspath(push_path), diags)
+
+        call_diag("diag_stop", Dict{String,Any}())
+        Joovy.CompileWatch._reset!()
+
+        # Stopped session: a push must not resurrect diagnostics.
+        FIPC2.call("source_push",
+                   Dict{String,Any}("path" => push_path, "content" => bad, "version" => 3))
+        @test isempty(Joovy.compile_watch_report())
+        Joovy.SourceProvider.source_invalidate!(push_path)
+    end
+
     # Teardown: leave CompileWatch state clean for test_ipc_bridge.jl (which
     # must stay the LAST included file -- see its own header comment).
     Joovy.compile_watch_stop!()

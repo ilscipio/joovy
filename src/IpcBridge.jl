@@ -568,6 +568,7 @@ function _handle_source_push(params)
     try
         abs_path = abspath(path)
         source_push!(abs_path, content, version)
+        CompileWatch.compile_watch_notify_push!(abs_path)
         elapsed = time_ns() - t0
         return Dict(
             "status" => "ok",

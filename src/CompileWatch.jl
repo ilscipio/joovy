@@ -1044,6 +1044,17 @@ function compile_watch_check(path_or_code::AbstractString; mod::Module=Main)::Ve
     return _run_static_rules(ast, path, mod)
 end
 
+# Called by IpcBridge on every `joovy/source_push` while a session runs.
+# The IDE debounces keystrokes and pushes the buffer; this re-scans that
+# file's static rules against the pushed text and marks the stream dirty,
+# so editor marks refresh as the user types. No-op when no session runs.
+function compile_watch_notify_push!(path::String)
+    (_running[] && _static_enabled[]) || return nothing
+    _scan_path!(abspath(path))
+    _dirty[] = true
+    return nothing
+end
+
 function _scan_path!(path::String)
     abs_path = abspath(path)
     src = try

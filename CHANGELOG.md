@@ -23,6 +23,9 @@ All notable changes to Joovy are documented here. This project adheres to
   gate that the chain fixture is flagged by `long-broadcast-fusion-chain`.
 - New config thresholds `broadcast_fusion_chain_over` (default 8) and
   `alloc_bytes_per_call_over` (default 1000000).
+- As-you-type diagnostics: `joovy/source_push` re-scans the pushed buffer
+  while a watch session runs. The IDE debounces and pushes on each edit.
+  Marks update without a save and without a manual re-scan.
 
 ### Changed
 
