@@ -78,6 +78,9 @@ call(route::String, params::Dict) = FIPC.call(route, params)
         @test call("reload", Dict{String,Any}("file" => nothing))["status"] == "error"
         @test call("reload", Dict{String,Any}())["status"] == "error"
         @test call("reload", Dict{String,Any}("file" => "x.jl", "incremental" => "yes"))["status"] == "error"
+        @test call("reload", Dict{String,Any}("file" => "x.jl", "content" => 42))["status"] == "error"
+        @test call("reload", Dict{String,Any}("file" => "x.jl", "content" => "code", "version" => "no"))["status"] == "error"
+        @test call("reload", Dict{String,Any}("file" => "x.jl", "content" => "code", "version" => true))["status"] == "error"
 
         tmpfile = joinpath(_ipc_test_dir, "scripts", "_ipc_reload.jl")
         write(tmpfile, "ipc_reload_fn(x) = x + 1\n")
@@ -86,6 +89,27 @@ call(route::String, params::Dict) = FIPC.call(route, params)
         @test r["mode"] == "full_reload"
 
         rm(tmpfile; force=true)
+    end
+
+    # =====================================================================
+    # 3b. reload with inline content: the pushed buffer is what compiles, and
+    # the reload itself performs zero disk reads (SourceProvider serves the
+    # push from cache instead of re-reading the file `joovy/reload` names).
+    # =====================================================================
+    @testset "reload with inline content (zero disk reads)" begin
+        tmpfile = joinpath(_ipc_test_dir, "scripts", "_ipc_reload_inline.jl")
+        write(tmpfile, "ipc_reload_inline_fn(x) = x + 1\n")   # disk content -- must NOT be what compiles
+
+        Joovy.source_clear!()
+        r = call("reload", Dict{String,Any}(
+            "file" => tmpfile, "content" => "ipc_reload_inline_fn(x) = x + 555\n", "version" => 1))
+        @test r["status"] == "ok"
+        @test Joovy.source_stats().disk_reads == 0
+
+        @test Base.invokelatest(getfield(Main, :ipc_reload_inline_fn), 1) == 556
+
+        rm(tmpfile; force=true)
+        Joovy.source_invalidate!(tmpfile)
     end
 
     # =====================================================================
@@ -147,6 +171,8 @@ call(route::String, params::Dict) = FIPC.call(route, params)
         @test call("use", Dict{String,Any}())["status"] == "error"
         @test call("use", Dict{String,Any}("path" => "x.jl", "tier" => "high"))["status"] == "error"
         @test call("use", Dict{String,Any}("path" => "x.jl", "tier" => true))["status"] == "error"
+        @test call("use", Dict{String,Any}("path" => "x.jl", "content" => 42))["status"] == "error"
+        @test call("use", Dict{String,Any}("path" => "x.jl", "content" => "code", "version" => "no"))["status"] == "error"
 
         tmpfile = joinpath(_ipc_test_dir, "scripts", "_ipc_use.jl")
         write(tmpfile, """
@@ -164,6 +190,33 @@ call(route::String, params::Dict) = FIPC.call(route, params)
             delete!(Joovy.IpcBridge._lazy_modules, abspath(tmpfile))
         end
         rm(tmpfile; force=true)
+    end
+
+    # =====================================================================
+    # 8b. use with inline content: the pushed buffer is what gets parsed and
+    # compiled, and the call performs zero disk reads.
+    # =====================================================================
+    @testset "use with inline content (zero disk reads)" begin
+        tmpfile = joinpath(_ipc_test_dir, "scripts", "_ipc_use_inline.jl")
+        write(tmpfile, "ipc_use_inline_fn(x) = x + 1\n")   # disk content -- must NOT be what's used
+
+        Joovy.source_clear!()
+        r = call("use", Dict{String,Any}(
+            "path" => tmpfile, "content" => "ipc_use_inline_fn(x) = x + 777\n", "version" => 1))
+        @test r["status"] == "ok"
+        @test Joovy.source_stats().disk_reads == 0
+
+        lm = lock(Joovy.IpcBridge._lazy_modules_lock) do
+            get(Joovy.IpcBridge._lazy_modules, abspath(tmpfile), nothing)
+        end
+        @test lm !== nothing
+        @test lm.ipc_use_inline_fn(2) == 779
+
+        lock(Joovy.IpcBridge._lazy_modules_lock) do
+            delete!(Joovy.IpcBridge._lazy_modules, abspath(tmpfile))
+        end
+        rm(tmpfile; force=true)
+        Joovy.source_invalidate!(tmpfile)
     end
 
     # =====================================================================
@@ -292,7 +345,56 @@ call(route::String, params::Dict) = FIPC.call(route, params)
     end
 
     # =====================================================================
-    # 17. counters
+    # 17. source_push
+    # =====================================================================
+    @testset "source_push" begin
+        @test call("source_push", Dict{String,Any}("path" => nothing, "content" => "x=1"))["status"] == "error"
+        @test call("source_push", Dict{String,Any}("path" => "x.jl"))["status"] == "error"                 # missing content
+        @test call("source_push", Dict{String,Any}("path" => "x.jl", "content" => nothing))["status"] == "error"
+        @test call("source_push", Dict{String,Any}("path" => "x.jl", "content" => 42))["status"] == "error"
+        @test call("source_push", Dict{String,Any}("path" => "x.jl", "content" => "x=1", "version" => "high"))["status"] == "error"
+        @test call("source_push", Dict{String,Any}("path" => "x.jl", "content" => "x=1", "version" => true))["status"] == "error"
+
+        tmpfile = joinpath(_ipc_test_dir, "scripts", "_ipc_source_push.jl")
+        r = call("source_push", Dict{String,Any}(
+            "path" => tmpfile, "content" => "ipc_source_push_fn(x) = x + 1\n", "version" => 1))
+        @test r["status"] == "ok"
+        @test r["path"] == abspath(tmpfile)
+        @test r["version"] == 1
+        @test Joovy.source_read(tmpfile) == "ipc_source_push_fn(x) = x + 1\n"
+
+        # version omitted -> valid, defaults to `nothing`
+        r2 = call("source_push", Dict{String,Any}(
+            "path" => tmpfile, "content" => "ipc_source_push_fn(x) = x + 2\n"))
+        @test r2["status"] == "ok"
+        @test r2["version"] === nothing
+        @test Joovy.source_read(tmpfile) == "ipc_source_push_fn(x) = x + 2\n"
+
+        Joovy.source_invalidate!(tmpfile)
+    end
+
+    # =====================================================================
+    # 18. source_invalidate
+    # =====================================================================
+    @testset "source_invalidate" begin
+        @test call("source_invalidate", Dict{String,Any}("path" => nothing))["status"] == "error"
+        @test call("source_invalidate", Dict{String,Any}())["status"] == "error"
+
+        tmpfile = joinpath(_ipc_test_dir, "scripts", "_ipc_source_invalidate.jl")
+        write(tmpfile, "ipc_source_invalidate_fn(x) = x + 1\n")
+        Joovy.source_push!(tmpfile, "ipc_source_invalidate_fn(x) = x + 999\n")
+        @test Joovy.source_read(tmpfile) == "ipc_source_invalidate_fn(x) = x + 999\n"
+
+        r = call("source_invalidate", Dict{String,Any}("path" => tmpfile))
+        @test r["status"] == "ok"
+        @test r["path"] == abspath(tmpfile)
+        @test Joovy.source_read(tmpfile) == "ipc_source_invalidate_fn(x) = x + 1\n"   # back to disk
+
+        rm(tmpfile; force=true)
+    end
+
+    # =====================================================================
+    # 19. counters
     # =====================================================================
     @testset "counters" begin
         r = call("counters", Dict{String,Any}())
@@ -304,4 +406,5 @@ call(route::String, params::Dict) = FIPC.call(route, params)
     Joovy.SpecQueue.spec_kill!()
     Joovy.joovy_speculate!(false)
     Joovy.joovy_dev_mode!(active=false)
+    Joovy.source_clear!()
 end

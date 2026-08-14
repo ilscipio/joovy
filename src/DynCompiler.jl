@@ -2,6 +2,7 @@ module DynCompiler
 
 using ..ExprCache
 using ..WorldAgeBridge
+using ..SourceProvider
 
 export joovy_compile, joovy_compile_file, joovy_recompile!,
        compilation_stats, GLOBAL_CACHE, AbstractJoovyCallable, JoovyCallable,
@@ -86,10 +87,10 @@ function joovy_compile(expr::Expr; name::Union{Symbol,Nothing}=nothing, mod::Mod
 end
 
 function joovy_compile_file(path::String; name::Union{Symbol,Nothing}=nothing, mod::Module=Main)
-    if !isfile(path)
+    if !source_exists(path)
         error("File not found: $path")
     end
-    code = read(path, String)
+    code = source_read(path)
     fname = name === nothing ? Symbol(splitext(basename(path))[1]) : name
     return joovy_compile(code; name=fname, mod=mod)
 end

@@ -1,6 +1,7 @@
 module ScriptEngine
 
 using ..DynCompiler
+using ..SourceProvider
 
 export JoovyEngine, joovy_run, joovy_run_file, joovy_watch!, joovy_unwatch!,
        EngineResult
@@ -66,19 +67,19 @@ end
 
 function joovy_run_file(engine::JoovyEngine, path::String;
                         bindings::Dict{Symbol,Any}=Dict{Symbol,Any}())
-    if !isfile(path)
+    if !source_exists(path)
         return EngineResult(nothing, false, ErrorException("File not found: $path"), UInt64(0))
     end
-    code = read(path, String)
+    code = source_read(path)
     return joovy_run(engine, code; bindings=bindings)
 end
 
 function joovy_watch!(engine::JoovyEngine, path::String, callback::Function)
-    if !isfile(path)
+    if !source_exists(path)
         error("File not found: $path")
     end
 
-    mtime_val = mtime(path)
+    mtime_val = source_mtime(path)
 
     lock(engine.lock) do
         engine.watched_files[path] = mtime_val
@@ -92,11 +93,11 @@ function joovy_watch!(engine::JoovyEngine, path::String, callback::Function)
             active = lock(engine.lock) do
                 get(engine.active_watchers, path, false)
             end
-            if !active || !isfile(path)
+            if !active || !source_exists(path)
                 break
             end
 
-            current_mtime = mtime(path)
+            current_mtime = source_mtime(path)
             old_mtime = lock(engine.lock) do
                 get(engine.watched_files, path, 0.0)
             end
@@ -106,7 +107,7 @@ function joovy_watch!(engine::JoovyEngine, path::String, callback::Function)
                     engine.watched_files[path] = current_mtime
                 end
                 try
-                    code = read(path, String)
+                    code = source_read(path)
                     result = joovy_run(engine, code)
                     callback(result)
                 catch e

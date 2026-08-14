@@ -3,6 +3,7 @@ module Debug
 using ..DynCompiler
 using ..HotSwap
 using ..ExprCache
+using ..SourceProvider
 
 export joovy_hot_reload, joovy_debug_info, is_joovy_frame, clean_frame_name,
        joovy_filter_stacktrace, joovy_breakpoint_map
@@ -39,7 +40,7 @@ function joovy_hot_reload(file::String;
                           mod::Module=Main,
                           incremental::Bool=true)
     file = abspath(file)
-    if !isfile(file)
+    if !source_exists(file)
         return (status="error", error="File not found: $file",
                 reloaded=Symbol[], unchanged=Symbol[],
                 fallback_definitions=0,
@@ -47,7 +48,7 @@ function joovy_hot_reload(file::String;
                 fallback_removed=Symbol[], fallback_unchanged=Symbol[])
     end
 
-    new_source = read(file, String)
+    new_source = source_read(file)
     reloaded = Symbol[]
     unchanged = Symbol[]
     matched_paths = Set{String}()

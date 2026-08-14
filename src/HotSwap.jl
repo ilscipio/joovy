@@ -2,6 +2,7 @@ module HotSwap
 
 using ..ExprCache
 using ..DynCompiler
+using ..SourceProvider
 
 export HotSwapRegistry, SwapEntry, hotswap_register!, hotswap_swap!,
        hotswap_call, hotswap_load_file!, hotswap_reload!, hotswap_reload_file!,
@@ -113,11 +114,11 @@ end
 function hotswap_load_file!(name::Symbol, path::String;
                             registry::HotSwapRegistry=GLOBAL_REGISTRY,
                             mod::Module=Main)
-    if !isfile(path)
+    if !source_exists(path)
         error("File not found: $path")
     end
 
-    code = read(path, String)
+    code = source_read(path)
     compiled = joovy_compile(code; name=name, mod=mod)
 
     entry = SwapEntry(
@@ -152,11 +153,11 @@ function hotswap_reload!(name::Symbol;
         error("Function :$name was not loaded from a file")
     end
 
-    if !isfile(path)
+    if !source_exists(path)
         error("File not found: $path")
     end
 
-    new_code = read(path, String)
+    new_code = source_read(path)
 
     old_code = lock(entry.lock) do
         entry.source
@@ -195,11 +196,11 @@ function hotswap_reload_file!(file::String;
                               registry::HotSwapRegistry=GLOBAL_REGISTRY,
                               mod::Module=Main)
     file = abspath(file)
-    if !isfile(file)
+    if !source_exists(file)
         error("File not found: $file")
     end
 
-    new_source = read(file, String)
+    new_source = source_read(file)
 
     matching = Tuple{Symbol,SwapEntry}[]
     lock(registry.lock) do

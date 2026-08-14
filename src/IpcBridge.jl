@@ -10,6 +10,8 @@ using ..PackageTier
 using ..Instrument
 using ..Config
 using ..SpecQueue
+using ..SourceProvider
+using ..CompileWatch
 
 export joovy_register_ipc_handlers!, joovy_ipc_available
 
@@ -91,6 +93,31 @@ function _opt_bool(params, key, default)
     v isa Bool ? v : nothing
 end
 
+# Same "absent-or-null -> default, wrong type -> nothing (=invalid)" shape as
+# `_opt_int`/`_opt_bool`, for a real-valued (Float64) parameter. `default` is
+# always a usable, non-nothing threshold value here, so `nothing` unambiguously
+# signals "invalid type", exactly like the existing int/bool helpers.
+function _opt_float(params, key, default)
+    haskey(params, key) || return default
+    v = params[key]; v === nothing && return default
+    v isa Bool && return nothing
+    v isa Real && return Float64(v)
+    return nothing
+end
+
+# Optional integer whose "no value supplied" default IS `nothing` (source version
+# numbers have no natural non-nothing default), so `_opt_int`'s collapsed
+# "invalid-or-absent -> nothing" return can't be used to tell the two apart.
+# Same absent/null-vs-wrong-type split as `_opt_string`, tupled the same way.
+function _opt_int_or_nothing(params, key)   # -> (Union{Int,Nothing}, valid::Bool)
+    haskey(params, key) || return (nothing, true)
+    v = params[key]; v === nothing && return (nothing, true)
+    v isa Bool && return (nothing, false)
+    v isa Integer && return (Int(v), true)
+    v isa AbstractFloat && isinteger(v) && return (Int(v), true)
+    return (nothing, false)
+end
+
 function _handle_compile(params)
     code = _req_string(params, "code")
     code === nothing && return _err("Missing or invalid 'code' parameter")
@@ -152,8 +179,15 @@ function _handle_reload(params)
     file === nothing && return _err("Missing or invalid 'file' parameter")
     incremental = _opt_bool(params, "incremental", true)
     incremental === nothing && return _err("Invalid 'incremental' parameter: must be a boolean")
+    content, content_valid = _opt_string(params, "content")
+    content_valid || return _err("Invalid 'content' parameter: must be a string")
+    version, version_valid = _opt_int_or_nothing(params, "version")
+    version_valid || return _err("Invalid 'version' parameter: must be an integer")
 
     abs_path = abspath(file)
+    if content !== nothing
+        source_push!(abs_path, content, version)
+    end
     t0 = time_ns()
     try
         lm = lock(_lazy_modules_lock) do
@@ -313,6 +347,14 @@ function _handle_use(params)
     path === nothing && return _err("Missing or invalid 'path' parameter")
     tier = _opt_int(params, "tier", 1)
     tier === nothing && return _err("Invalid 'tier' parameter: must be an integer")
+    content, content_valid = _opt_string(params, "content")
+    content_valid || return _err("Invalid 'content' parameter: must be a string")
+    version, version_valid = _opt_int_or_nothing(params, "version")
+    version_valid || return _err("Invalid 'version' parameter: must be an integer")
+
+    if content !== nothing
+        source_push!(abspath(path), content, version)
+    end
 
     t0 = time_ns()
     try
@@ -511,6 +553,121 @@ function _handle_promote(params)
     end
 end
 
+# Push an editor-buffer's content into SourceProvider's cache ahead of any read
+# (reload/use, or a plain future disk read) -- lets the IDE hand over an unsaved
+# buffer so the compiler sees it without a round trip through disk.
+function _handle_source_push(params)
+    path = _req_string(params, "path")
+    path === nothing && return _err("Missing or invalid 'path' parameter")
+    content = _req_string(params, "content")
+    content === nothing && return _err("Missing or invalid 'content' parameter")
+    version, version_valid = _opt_int_or_nothing(params, "version")
+    version_valid || return _err("Invalid 'version' parameter: must be an integer")
+
+    t0 = time_ns()
+    try
+        abs_path = abspath(path)
+        source_push!(abs_path, content, version)
+        elapsed = time_ns() - t0
+        return Dict(
+            "status" => "ok",
+            "path" => abs_path,
+            "version" => version,
+            "time_ns" => elapsed
+        )
+    catch e
+        elapsed = time_ns() - t0
+        return merge(_err(sprint(showerror, e)), Dict("path" => path, "time_ns" => elapsed))
+    end
+end
+
+# Drop a cached SourceProvider entry, e.g. when the IDE closes an unsaved buffer
+# and later reads should fall back to disk (or a provider) again.
+function _handle_source_invalidate(params)
+    path = _req_string(params, "path")
+    path === nothing && return _err("Missing or invalid 'path' parameter")
+
+    t0 = time_ns()
+    try
+        abs_path = abspath(path)
+        source_invalidate!(abs_path)
+        elapsed = time_ns() - t0
+        return Dict("status" => "ok", "path" => abs_path, "time_ns" => elapsed)
+    catch e
+        elapsed = time_ns() - t0
+        return merge(_err(sprint(showerror, e)), Dict("path" => path, "time_ns" => elapsed))
+    end
+end
+
+# Start (or reconfigure) a CompileWatch diagnostics session: static rules over
+# `paths` (if given) and/or the dynamic compile-time capture layer. Pushes a
+# `joovy/diagnostics` full-snapshot notification once the session is up so the
+# IDE doesn't have to wait for the first throttle tick.
+function _handle_diag_start(params)
+    paths_raw = get(params, "paths", nothing)
+    paths = String[]
+    if paths_raw !== nothing
+        paths_raw isa AbstractVector ||
+            return _err("Invalid 'paths' parameter: must be an array of strings")
+        for p in paths_raw
+            p isa AbstractString ||
+                return _err("Invalid 'paths' parameter: must be an array of strings")
+            push!(paths, String(p))
+        end
+    end
+    static = _opt_bool(params, "static", true)
+    static === nothing && return _err("Invalid 'static' parameter: must be a boolean")
+    dynamic = _opt_bool(params, "dynamic", true)
+    dynamic === nothing && return _err("Invalid 'dynamic' parameter: must be a boolean")
+    spec_over = _opt_int(params, "specializations_over", 32)
+    spec_over === nothing && return _err("Invalid 'specializations_over' parameter: must be an integer")
+    infer_ms_over = _opt_float(params, "inference_self_ms_over", 50.0)
+    infer_ms_over === nothing && return _err("Invalid 'inference_self_ms_over' parameter: must be a number")
+    reinfer_over = _opt_int(params, "reinfer_count_over", 3)
+    reinfer_over === nothing && return _err("Invalid 'reinfer_count_over' parameter: must be an integer")
+
+    t0 = time_ns()
+    try
+        compile_watch_set_thresholds!(specializations_over=spec_over,
+            inference_self_ms_over=infer_ms_over, reinfer_count_over=reinfer_over)
+        result = compile_watch_start!(static=static, dynamic=dynamic, paths=paths)
+        elapsed = time_ns() - t0
+        resp = Dict(
+            "status" => "ok",
+            "static" => static,
+            "dynamic_requested" => dynamic,
+            "dynamic_active" => result.dynamic_active,
+            "static_diagnostic_count" => result.static_diagnostic_count,
+            "time_ns" => elapsed,
+        )
+        _notify("joovy/diagnostics", compile_watch_wire_snapshot())
+        return resp
+    catch e
+        elapsed = time_ns() - t0
+        return merge(_err(sprint(showerror, e)), Dict("time_ns" => elapsed))
+    end
+end
+
+function _handle_diag_stop(params)
+    t0 = time_ns()
+    try
+        compile_watch_stop!()
+        elapsed = time_ns() - t0
+        return Dict("status" => "ok", "time_ns" => elapsed)
+    catch e
+        elapsed = time_ns() - t0
+        return merge(_err(sprint(showerror, e)), Dict("time_ns" => elapsed))
+    end
+end
+
+function _handle_diag_report(params)
+    try
+        return compile_watch_wire_snapshot()
+    catch e
+        return _err(sprint(showerror, e))
+    end
+end
+
 function _ipc_handler_table()
     [
         ("compile", _handle_compile),
@@ -529,6 +686,11 @@ function _ipc_handler_table()
         ("promote_all", _handle_promote_all),
         ("apply_preferences", _handle_apply_preferences),
         ("promote", _handle_promote),
+        ("source_push", _handle_source_push),
+        ("source_invalidate", _handle_source_invalidate),
+        ("diag_start", _handle_diag_start),
+        ("diag_stop", _handle_diag_stop),
+        ("diag_report", _handle_diag_report),
     ]
 end
 

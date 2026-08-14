@@ -40,6 +40,16 @@ const _fn_tier_config  = Dict{Tuple{Symbol,Symbol}, Int}()  # (module, function)
 const _default_tier    = Ref{Union{Int,Nothing}}(nothing)
 const _has_config      = Ref{Bool}(false)
 
+# Hook Ref for the reserved `compile_watch` key: CompileWatch.jl is included
+# (and `using ..Config`'d) AFTER this module, so the dependency direction is
+# the opposite of `Instrument._config_fn_tier_lookup` above -- rather than
+# Config installing a callback INTO CompileWatch (not yet defined at this
+# module's include time), CompileWatch installs ITSELF into this Ref once it
+# loads, and `_apply_prefs!` below just calls whatever is here (a no-op
+# `nothing` if CompileWatch hasn't loaded for some reason). Same Ref{Any}-hook
+# shape, mirrored across the opposite include-order direction.
+const _compile_watch_toggle_hook = Ref{Any}(nothing)
+
 # ===================================================================
 # Tier-name parsing: "tier_0"/int/alias -> Int (0/1/2), else nothing
 # ===================================================================
@@ -71,6 +81,25 @@ function _parse_bool(x)::Union{Bool,Nothing}
         s = lowercase(strip(x))
         s == "true"  && return true
         s == "false" && return false
+    end
+    return nothing
+end
+
+# ===================================================================
+# On/off-value parsing for the reserved `compile_watch` key -> Bool/nothing.
+# Same shape as `_parse_bool`, kept separate rather than extending it: the
+# design's compile_watch contract is specifically "on"/"off" (not
+# "true"/"false", which `speculate` already owns and test_config.jl already
+# pins), so this accepts both vocabularies rather than changing what
+# `_parse_bool` recognizes for the existing key.
+# ===================================================================
+
+function _parse_on_off(x)::Union{Bool,Nothing}
+    x isa Bool && return x
+    if x isa AbstractString
+        s = lowercase(strip(x))
+        s in ("on", "true")   && return true
+        s in ("off", "false") && return false
     end
     return nothing
 end
@@ -176,6 +205,22 @@ function _apply_prefs!(prefs::AbstractDict; fallback_tier::Union{Int,Nothing}=no
                 b === nothing ?
                     @warn("Joovy config: invalid value for `speculate`: $(repr(val)) (ignored)") :
                     SpecQueue.joovy_speculate!(b)
+                continue
+            end
+            if key == "compile_watch"
+                b = _parse_on_off(val)
+                if b === nothing
+                    @warn "Joovy config: invalid value for `compile_watch`: $(repr(val)) (ignored)"
+                else
+                    hook = _compile_watch_toggle_hook[]
+                    if hook !== nothing
+                        try
+                            hook(b)
+                        catch e
+                            @warn "Joovy config: compile_watch hook failed" exception=e
+                        end
+                    end
+                end
                 continue
             end
             t = _parse_tier(val)

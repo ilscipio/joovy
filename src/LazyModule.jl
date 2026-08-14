@@ -3,6 +3,7 @@ module LazyModules
 using ..DynCompiler
 using ..CompileTimeline
 using ..TieredCompile
+using ..SourceProvider
 
 export LazyModule, joovy_use, joovy_reload!, joovy_watch_lazy!, joovy_promote_lazy!,
        lazy_status, lazy_compiled, lazy_pending
@@ -272,8 +273,8 @@ end
 
 function joovy_use(path::String; mod::Module=Main, tier::Int=1,
                    promote_threshold::Int=10)
-    isfile(path) || error("File not found: $path")
-    code = read(path, String)
+    source_exists(path) || error("File not found: $path")
+    code = source_read(path)
     ast = Meta.parse("begin\n$code\nend")
 
     preamble, definitions = _split_preamble_defs(ast)
@@ -307,8 +308,8 @@ function joovy_use(path::String; mod::Module=Main, tier::Int=1,
 end
 
 function joovy_reload!(lm::LazyModule)
-    isfile(lm.path) || error("File not found: $(lm.path)")
-    code = read(lm.path, String)
+    source_exists(lm.path) || error("File not found: $(lm.path)")
+    code = source_read(lm.path)
     ast = Meta.parse("begin\n$code\nend")
 
     new_preamble, new_definitions = _split_preamble_defs(ast)
@@ -362,11 +363,11 @@ end
 
 function joovy_watch_lazy!(lm::LazyModule; interval::Float64=0.5)
     @async begin
-        last_mtime = mtime(lm.path)
+        last_mtime = source_mtime(lm.path)
         while true
             sleep(interval)
-            isfile(lm.path) || break
-            current_mtime = mtime(lm.path)
+            source_exists(lm.path) || break
+            current_mtime = source_mtime(lm.path)
             if current_mtime > last_mtime
                 last_mtime = current_mtime
                 try

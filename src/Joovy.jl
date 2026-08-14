@@ -3,7 +3,9 @@ module Joovy
 _mean(x) = isempty(x) ? 0.0 : sum(x) / length(x)
 
 include("ExprCache.jl")
+include("SourcePos.jl")
 include("WorldAgeBridge.jl")
+include("SourceProvider.jl")
 include("DynCompiler.jl")
 include("HotSwap.jl")
 include("StaticCompile.jl")
@@ -20,12 +22,14 @@ include("JoovyObject.jl")
 include("ScriptEngine.jl")
 include("AutoTune.jl")
 include("Debug.jl")
+include("CompileWatch.jl")
 include("IpcBridge.jl")
 include("Integration.jl")
 include("Warmup.jl")
 
 using .ExprCache
 using .WorldAgeBridge
+using .SourceProvider
 using .DynCompiler
 using .HotSwap
 using .StaticCompile
@@ -41,6 +45,7 @@ using .JoovyObjects
 using .ScriptEngine
 using .AutoTune
 using .Debug
+using .CompileWatch
 using .IpcBridge
 using .Integration
 using .Warmup
@@ -52,6 +57,10 @@ export JoovyCache, cache_put!, cache_get, cache_has, cache_register!,
 
 # WorldAgeBridge
 export joovy_eval, joovy_function, invoke_joovy
+
+# SourceProvider
+export source_read, source_mtime, source_exists, source_push!, source_invalidate!,
+       register_source_provider!, source_stats, source_clear!
 
 # DynCompiler
 export joovy_compile, joovy_compile_file, joovy_recompile!,
@@ -117,6 +126,11 @@ export TuneResult, TuneConfig, joovy_autotune, joovy_autotune_compare,
 # Debug
 export joovy_hot_reload, joovy_debug_info, is_joovy_frame, clean_frame_name,
        joovy_filter_stacktrace, joovy_breakpoint_map
+
+# CompileWatch
+export CWDiagnostic, compile_watch_start!, compile_watch_stop!, compile_watch_report,
+       compile_watch_check, compile_watch_set_thresholds!, compile_watch_wire_snapshot,
+       compile_watch_status
 
 # IpcBridge
 export joovy_register_ipc_handlers!, joovy_ipc_available
