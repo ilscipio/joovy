@@ -84,7 +84,14 @@ route call this.
 """
 function compile_watch_wire_snapshot()
     diags = compile_watch_report()
-    return Dict{String,Any}("diagnostics" => Any[_wire(d) for d in diags])
+    # `scope` tells the IDE which slice of its cache this snapshot replaces:
+    # a static-only session (the headless analyzer) must not clobber the
+    # dynamic diagnostics a REPL session streams, and vice versa.
+    scope = _static_enabled[] && !_dynamic_requested[] ? "static" :
+            _dynamic_requested[] && !_static_enabled[] ? "dynamic" : "all"
+    return Dict{String,Any}(
+        "diagnostics" => Any[_wire(d) for d in diags],
+        "scope" => scope)
 end
 
 # ===================================================================
@@ -104,6 +111,24 @@ const _alloc_diagnostics = Dict{Symbol,CWDiagnostic}()            # fn name -> l
 
 const _dirty = Ref{Bool}(false)
 const _stream_started = Ref{Bool}(false)
+
+# Rules the user switched off (IDE setting, delivered via diag_start's
+# `disabled_rules` param). Filtered in `compile_watch_report`, so the editor
+# marks, the status panel, and the stream all honor it from one place.
+const _disabled_rules = Ref{Set{Symbol}}(Set{Symbol}())
+
+"""
+    set_disabled_rules!(ids) -> Int
+
+Replace the disabled-rule set. Accepts any iterable of strings or symbols.
+Returns the resulting set size. Unknown ids are kept (harmless) so the IDE
+can send a superset across Joovy versions.
+"""
+function set_disabled_rules!(ids)
+    _disabled_rules[] = Set{Symbol}(Symbol(x) for x in ids)
+    _dirty[] = true
+    return length(_disabled_rules[])
+end
 
 # 1.12 capture buffer (installed once for the whole session; drained by
 # copy+empty! rather than reinstalling, since jl_set_newly_inferred keeps
@@ -1533,6 +1558,8 @@ function compile_watch_report()::Vector{CWDiagnostic}
         for v in values(_alloc_diagnostics)
             push!(diags, v)
         end
+        disabled = _disabled_rules[]
+        isempty(disabled) || filter!(d -> !(d.rule_id in disabled), diags)
         sort!(diags; by = d -> (d.file, d.line, string(d.rule_id)))
         return diags
     end
@@ -1570,6 +1597,7 @@ function _reset!()
     end
     _dirty[] = false
     _thresholds[] = _Thresholds(32, 50.0, 3, 8, 1_000_000)
+    _disabled_rules[] = Set{Symbol}()
     return nothing
 end
 

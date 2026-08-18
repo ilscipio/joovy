@@ -172,6 +172,37 @@ call_diag(route::String, params::Dict) = FIPC2.call(route, params)
         Joovy.SourceProvider.source_invalidate!(push_path)
     end
 
+    # =====================================================================
+    # 7. disabled_rules filtering + snapshot scope
+    # =====================================================================
+    @testset "disabled_rules and scope" begin
+        tmpfile = joinpath(_cwipc_dir, "scripts", "_cwipc_disable.jl")
+        write(tmpfile, "function cwipc_dis_fn(cb, x)\n    cb(x) + 1\nend\n")
+
+        @test call_diag("diag_start", Dict{String,Any}("disabled_rules" => "notanarray"))["status"] == "error"
+        @test call_diag("diag_start", Dict{String,Any}("disabled_rules" => [1]))["status"] == "error"
+
+        r = call_diag("diag_start", Dict{String,Any}(
+            "paths" => [tmpfile], "static" => true, "dynamic" => false,
+            "disabled_rules" => ["closure-arg-respecialization"]))
+        @test r["status"] == "ok"
+        snap = Joovy.CompileWatch.compile_watch_wire_snapshot()
+        @test snap["scope"] == "static"
+        @test !any(d -> d["rule_id"] == "closure-arg-respecialization", snap["diagnostics"])
+
+        # Re-enable: present list replaces the old one.
+        r = call_diag("diag_start", Dict{String,Any}(
+            "paths" => [tmpfile], "static" => true, "dynamic" => false,
+            "disabled_rules" => String[]))
+        @test r["status"] == "ok"
+        snap = Joovy.CompileWatch.compile_watch_wire_snapshot()
+        @test any(d -> d["rule_id"] == "closure-arg-respecialization", snap["diagnostics"])
+
+        call_diag("diag_stop", Dict{String,Any}())
+        rm(tmpfile; force=true)
+        Joovy.CompileWatch._reset!()
+    end
+
     # Teardown: leave CompileWatch state clean for test_ipc_bridge.jl (which
     # must stay the LAST included file -- see its own header comment).
     Joovy.compile_watch_stop!()

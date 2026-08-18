@@ -26,6 +26,12 @@ All notable changes to Joovy are documented here. This project adheres to
 - As-you-type diagnostics: `joovy/source_push` re-scans the pushed buffer
   while a watch session runs. The IDE debounces and pushes on each edit.
   Marks update without a save and without a manual re-scan.
+- The `joovy/diagnostics` payload carries a `scope` (static/dynamic/all), so
+  a static-only analyzer session and a dynamic REPL session can feed one IDE
+  cache without overwriting each other.
+- `joovy/diag_start` accepts `disabled_rules` (array of rule ids); filtering
+  happens in `compile_watch_report`, so the editor, the panel, and the stream
+  all honor it.
 
 ### Changed
 
