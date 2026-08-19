@@ -73,10 +73,12 @@ end
     source_push!(path, content, version=nothing)
 
 Push editor-buffer `content` for `path` into the cache. Keyed by `abspath`.
-
-Out-of-order guard: if the cached entry already has a non-`nothing` version
-and the incoming `version` is non-`nothing` and `<=` the cached one, the push
-is dropped (a stale push arriving after a newer one must not win).
+The LAST push always wins. There is deliberately NO version-ordering guard:
+pushes arrive on one ordered IPC stream, so real reordering cannot happen,
+and the IDE's `version` (the document modification stamp) moves BACKWARD on
+undo -- a guard here silently ate the undo push, so a reverted fix never got
+re-scanned and its mark stayed gone. `version` is stored for observability
+only.
 """
 function source_push!(path::AbstractString, content::AbstractString,
                        version::Union{Int,Nothing}=nothing)
@@ -84,11 +86,6 @@ function source_push!(path::AbstractString, content::AbstractString,
     disk_mtime = _safe_mtime(abs_path)   # I/O happens BEFORE the lock is taken
 
     lock(_cache_lock) do
-        existing = get(_cache, abs_path, nothing)
-        if existing !== nothing && existing.version !== nothing &&
-           version !== nothing && version <= existing.version
-            return nothing
-        end
         _cache[abs_path] = _Entry(String(content), version, disk_mtime)
         return nothing
     end

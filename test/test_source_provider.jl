@@ -73,21 +73,24 @@ using Joovy
     end
 
     # =====================================================================
-    # 4. Out-of-order push guard: version <= cached version is dropped.
+    # 4. Last push wins, regardless of version. The IDE's modification stamp
+    #    moves BACKWARD on undo; a version guard here ate the undo push and a
+    #    reverted quick-fix never got re-scanned (its mark stayed gone).
+    #    Pushes ride one ordered IPC stream, so real reordering cannot occur.
     # =====================================================================
-    @testset "out-of-order push (version <= cached) is dropped" begin
+    @testset "last push wins (undo sends a lower version)" begin
         path = joinpath(scripts_dir, "_sp_version.jl")
 
         source_push!(path, "sp_version_fn(x) = x + 1\n", 5)
         @test source_read(path) == "sp_version_fn(x) = x + 1\n"
 
-        source_push!(path, "sp_version_fn(x) = x + 999\n", 3)   # older -- dropped
+        source_push!(path, "sp_version_fn(x) = x + 999\n", 3)   # undo: lower version, still wins
+        @test source_read(path) == "sp_version_fn(x) = x + 999\n"
+
+        source_push!(path, "sp_version_fn(x) = x + 1\n", 3)     # equal version, still wins
         @test source_read(path) == "sp_version_fn(x) = x + 1\n"
 
-        source_push!(path, "sp_version_fn(x) = x + 999\n", 5)   # equal -- dropped
-        @test source_read(path) == "sp_version_fn(x) = x + 1\n"
-
-        source_push!(path, "sp_version_fn(x) = x + 999\n", 6)   # newer -- wins
+        source_push!(path, "sp_version_fn(x) = x + 999\n", nothing)  # no version, still wins
         @test source_read(path) == "sp_version_fn(x) = x + 999\n"
 
         source_clear!()
