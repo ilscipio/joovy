@@ -626,6 +626,8 @@ function _handle_diag_start(params)
     infer_ms_over === nothing && return _err("Invalid 'inference_self_ms_over' parameter: must be a number")
     reinfer_over = _opt_int(params, "reinfer_count_over", 3)
     reinfer_over === nothing && return _err("Invalid 'reinfer_count_over' parameter: must be an integer")
+    compile_ms_over = _opt_float(params, "compile_ms_over", 100.0)
+    compile_ms_over === nothing && return _err("Invalid 'compile_ms_over' parameter: must be a number")
     disabled_raw = get(params, "disabled_rules", nothing)
     disabled = nothing
     if disabled_raw !== nothing
@@ -641,7 +643,8 @@ function _handle_diag_start(params)
     t0 = time_ns()
     try
         compile_watch_set_thresholds!(specializations_over=spec_over,
-            inference_self_ms_over=infer_ms_over, reinfer_count_over=reinfer_over)
+            inference_self_ms_over=infer_ms_over, reinfer_count_over=reinfer_over,
+            compile_ms_over=compile_ms_over)
         # Present = replace (the IDE sends its full setting); absent = unchanged.
         disabled === nothing || CompileWatch.set_disabled_rules!(disabled)
         result = compile_watch_start!(static=static, dynamic=dynamic, paths=paths)

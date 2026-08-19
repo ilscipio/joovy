@@ -35,6 +35,8 @@ call_diag(route::String, params::Dict) = FIPC2.call(route, params)
         @test call_diag("diag_start", Dict{String,Any}("inference_self_ms_over" => "high"))["status"] == "error"
         @test call_diag("diag_start", Dict{String,Any}("inference_self_ms_over" => true))["status"] == "error"
         @test call_diag("diag_start", Dict{String,Any}("reinfer_count_over" => "high"))["status"] == "error"
+        @test call_diag("diag_start", Dict{String,Any}("compile_ms_over" => "high"))["status"] == "error"
+        @test call_diag("diag_start", Dict{String,Any}("compile_ms_over" => true))["status"] == "error"
 
         tmpfile = joinpath(_cwipc_dir, "scripts", "_cwipc_start.jl")
         write(tmpfile, """
@@ -59,6 +61,13 @@ call_diag(route::String, params::Dict) = FIPC2.call(route, params)
         notif = [n for n in FIPC2._notifications if n[1] == "joovy/diagnostics"]
         @test !isempty(notif)
         @test haskey(notif[end][2], "diagnostics")
+
+        # The wire snapshot carries the "fix" key for a closure fixture
+        # (closure-arg-respecialization is one of the three rules with a fix
+        # hint -- see CompileWatch.jl's `_rule_closure_arg`).
+        diag0 = notif[end][2]["diagnostics"][1]
+        @test diag0["rule_id"] == "closure-arg-respecialization"
+        @test diag0["fix"] == Dict("kind" => "nospecialize-arg", "symbol" => "cb")
 
         Joovy.compile_watch_stop!()
         rm(tmpfile; force=true)

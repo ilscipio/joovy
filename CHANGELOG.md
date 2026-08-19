@@ -32,6 +32,12 @@ All notable changes to Joovy are documented here. This project adheres to
 - `joovy/diag_start` accepts `disabled_rules` (array of rule ids); filtering
   happens in `compile_watch_report`, so the editor, the panel, and the stream
   all honor it.
+- New dynamic rule `dynamic-compile-time-over` (Julia 1.12+): marks a method
+  whose measured total compilation (inference + codegen) exceeds
+  `compile_ms_over` (default 100 ms). Silent on 1.9-1.11.
+- Three rules now ship machine-readable fix hints on the wire (`fix` key:
+  nospecialize-arg, float-init, make-const) so the IDE offers one-click
+  quick fixes.
 
 ### Changed
 

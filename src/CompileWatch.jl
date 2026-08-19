@@ -58,10 +58,20 @@ struct CWDiagnostic
     suggestion::String
     source::Symbol               # :static | :dynamic
     metric::Union{Nothing,Dict{String,Any}}
+    fix::Union{Nothing,Dict{String,String}}   # optional machine-actionable fix hint
 end
 
+# Outer constructor at the OLD (pre-`fix`) arity: every call site written
+# before `fix` existed keeps working unchanged, with `fix` defaulting to
+# `nothing` (no hint) -- only the three rules named in the task brief pass
+# `fix` explicitly via the full 10-arg inner constructor.
+CWDiagnostic(rule_id::Symbol, severity::Symbol, file::String, line::Int, method_name::Symbol,
+             message::String, suggestion::String, source::Symbol,
+             metric::Union{Nothing,Dict{String,Any}}) =
+    CWDiagnostic(rule_id, severity, file, line, method_name, message, suggestion, source, metric, nothing)
+
 function _wire(d::CWDiagnostic)
-    Dict{String,Any}(
+    w = Dict{String,Any}(
         "rule_id"    => string(d.rule_id),
         "severity"   => string(d.severity),
         "file"       => d.file,
@@ -72,6 +82,8 @@ function _wire(d::CWDiagnostic)
         "source"     => string(d.source),
         "metric"     => d.metric,
     )
+    d.fix === nothing || (w["fix"] = d.fix)
+    return w
 end
 
 """
@@ -157,38 +169,43 @@ mutable struct _Thresholds
     reinfer_count_over::Int
     broadcast_fusion_chain_over::Int   # static: long-broadcast-fusion-chain
     alloc_bytes_per_call_over::Int     # dynamic: allocation-heavy-method
+    compile_ms_over::Float64           # dynamic: dynamic-compile-time-over
 end
-const _thresholds = Ref(_Thresholds(32, 50.0, 3, 8, 1_000_000))
+const _thresholds = Ref(_Thresholds(32, 50.0, 3, 8, 1_000_000, 100.0))
 
 """
     compile_watch_set_thresholds!(; specializations_over=nothing,
                                     inference_self_ms_over=nothing,
                                     reinfer_count_over=nothing,
                                     broadcast_fusion_chain_over=nothing,
-                                    alloc_bytes_per_call_over=nothing)
+                                    alloc_bytes_per_call_over=nothing,
+                                    compile_ms_over=nothing)
 
 Override one or more thresholds (defaults: 32 specializations, 50ms
 self-inference time, 3 re-inferences, 8 fused broadcast ops per statement,
-1_000_000 allocated bytes/call). Only provided keys change; `nothing` (the
-default for each) leaves that threshold as-is. Returns the resulting
-threshold set.
+1_000_000 allocated bytes/call, 100ms total compile time). Only provided keys
+change; `nothing` (the default for each) leaves that threshold as-is. Returns
+the resulting threshold set.
 """
 function compile_watch_set_thresholds!(; specializations_over::Union{Integer,Nothing}=nothing,
                                         inference_self_ms_over::Union{Real,Nothing}=nothing,
                                         reinfer_count_over::Union{Integer,Nothing}=nothing,
                                         broadcast_fusion_chain_over::Union{Integer,Nothing}=nothing,
-                                        alloc_bytes_per_call_over::Union{Integer,Nothing}=nothing)
+                                        alloc_bytes_per_call_over::Union{Integer,Nothing}=nothing,
+                                        compile_ms_over::Union{Real,Nothing}=nothing)
     t = _thresholds[]
     specializations_over === nothing || (t.specializations_over = Int(specializations_over))
     inference_self_ms_over === nothing || (t.inference_self_ms_over = Float64(inference_self_ms_over))
     reinfer_count_over === nothing || (t.reinfer_count_over = Int(reinfer_count_over))
     broadcast_fusion_chain_over === nothing || (t.broadcast_fusion_chain_over = Int(broadcast_fusion_chain_over))
     alloc_bytes_per_call_over === nothing || (t.alloc_bytes_per_call_over = Int(alloc_bytes_per_call_over))
+    compile_ms_over === nothing || (t.compile_ms_over = Float64(compile_ms_over))
     return (specializations_over = t.specializations_over,
             inference_self_ms_over = t.inference_self_ms_over,
             reinfer_count_over = t.reinfer_count_over,
             broadcast_fusion_chain_over = t.broadcast_fusion_chain_over,
-            alloc_bytes_per_call_over = t.alloc_bytes_per_call_over)
+            alloc_bytes_per_call_over = t.alloc_bytes_per_call_over,
+            compile_ms_over = t.compile_ms_over)
 end
 
 # ===================================================================
@@ -374,7 +391,8 @@ function _rule_closure_arg(fd::_FuncDef, path::String)::Vector{CWDiagnostic}
             _RULE_CLOSURE_ARG, :warning, path, line, fd.name,
             "Argument `$(callee)` of `$(fd.name)` is invoked as a closure call -- each distinct closure passed in gets its own specialization.",
             "Add `@nospecialize $(callee)` or hoist a named const function instead of a closure literal.",
-            :static, nothing))
+            :static, nothing,
+            Dict("kind" => "nospecialize-arg", "symbol" => String(callee))))
         return nothing
     end
     return out
@@ -486,13 +504,25 @@ end
 function _toplevel_names(ast)
     const_like = Set{Symbol}()
     non_const = Set{Symbol}()
-    _scan_toplevel!(ast, const_like, non_const)
-    return const_like, non_const
+    non_const_lines = Dict{Symbol,Int}()
+    _scan_toplevel!(ast, const_like, non_const, non_const_lines, Ref(0))
+    return const_like, non_const, non_const_lines
 end
 
-function _scan_toplevel!(ast, const_like::Set{Symbol}, non_const::Set{Symbol})
+# `cursor` tracks the current source line via the `LineNumberNode`s
+# interleaved among `stmts` (same threaded-cursor convention as
+# `_collect_fusion_statements!`), so a non-const global's OWN top-level
+# assignment line can be recorded in `non_const_lines` for the
+# `untyped-global-in-fn` fix hint's `def_line` -- first occurrence per name
+# wins, matching `_rule_int_float_acc`'s `inits` convention.
+function _scan_toplevel!(ast, const_like::Set{Symbol}, non_const::Set{Symbol},
+                          non_const_lines::Dict{Symbol,Int}, cursor::Ref{Int})
     stmts = (ast isa Expr && ast.head in (:block, :toplevel)) ? ast.args : Any[ast]
     for stmt0 in stmts
+        if stmt0 isa LineNumberNode
+            cursor[] = stmt0.line
+            continue
+        end
         stmt0 isa Expr || continue
         # `@static if ... else ... end` (version-gated code, e.g. this very
         # file's 1.9-1.11 vs 1.12 dynamic-layer split): treat BOTH branches as
@@ -502,14 +532,14 @@ function _scan_toplevel!(ast, const_like::Set{Symbol}, non_const::Set{Symbol})
            stmt0.args[1] === Symbol("@static") && stmt0.args[end] isa Expr &&
            stmt0.args[end].head === :if
             ifexpr = stmt0.args[end]
-            _scan_toplevel!(ifexpr.args[2], const_like, non_const)
-            length(ifexpr.args) >= 3 && _scan_toplevel!(ifexpr.args[3], const_like, non_const)
+            _scan_toplevel!(ifexpr.args[2], const_like, non_const, non_const_lines, cursor)
+            length(ifexpr.args) >= 3 && _scan_toplevel!(ifexpr.args[3], const_like, non_const, non_const_lines, cursor)
             continue
         end
         stmt = _unwrap_macro_funcdef(stmt0)
         if stmt.head === :module && length(stmt.args) >= 3
             stmt.args[2] isa Symbol && push!(const_like, stmt.args[2])
-            _scan_toplevel!(stmt.args[3], const_like, non_const)
+            _scan_toplevel!(stmt.args[3], const_like, non_const, non_const_lines, cursor)
         elseif LazyModules._is_function_def(stmt)
             nm = _def_name(stmt)
             nm !== nothing && push!(const_like, nm)
@@ -529,6 +559,7 @@ function _scan_toplevel!(ast, const_like::Set{Symbol}, non_const::Set{Symbol})
             nm = _assign_target_name(stmt.args[1])
             if nm !== nothing && !(nm in const_like)
                 push!(non_const, nm)
+                haskey(non_const_lines, nm) || (non_const_lines[nm] = cursor[])
             end
         end
     end
@@ -732,7 +763,8 @@ function _each_read(f, node, cursor::Ref{Int})
 end
 
 function _rule_untyped_global(fd::_FuncDef, path::String, const_like::Set{Symbol},
-                              non_const::Set{Symbol}, mod::Module)::Vector{CWDiagnostic}
+                              non_const::Set{Symbol}, non_const_lines::Dict{Symbol,Int},
+                              mod::Module)::Vector{CWDiagnostic}
     out = CWDiagnostic[]
     locals = _collect_locals(fd)
     flagged = Set{Symbol}()
@@ -744,11 +776,13 @@ function _rule_untyped_global(fd::_FuncDef, path::String, const_like::Set{Symbol
 
         if sym in non_const
             push!(flagged, sym)
+            def_line = get(non_const_lines, sym, line)
             push!(out, CWDiagnostic(
                 _RULE_UNTYPED_GLOBAL, :warning, path, line, fd.name,
                 "`$(fd.name)` reads module-level global `$(sym)`, which is not declared `const` -- every reassignment invalidates and re-infers every reader.",
                 "Declare `const $(sym) = ...`, pass it as an argument, or wrap it in a `Ref{T}`.",
-                :static, nothing))
+                :static, nothing,
+                Dict("kind" => "make-const", "symbol" => String(sym), "def_line" => string(def_line))))
         elseif !(sym in const_like) && !_resolved_const(sym, mod)
             push!(flagged, sym)
             # Weaker confidence (:hint, not :warning): we could not resolve this
@@ -1023,7 +1057,8 @@ function _rule_int_float_acc(fd::_FuncDef, path::String)::Vector{CWDiagnostic}
         push!(out, CWDiagnostic(_RULE_INT_FLOAT_ACC, :hint, path, inits[lhs], fd.name,
             "`$(lhs)` in `$(fd.name)` is initialized from an integer literal but later promoted to float -- inference widens and the accumulator boxes.",
             "Initialize with 0.0 or zero(T); verify with @code_warntype.",
-            :static, nothing))
+            :static, nothing,
+            Dict("kind" => "float-init", "symbol" => String(lhs))))
         return nothing
     end
     return out
@@ -1032,13 +1067,13 @@ end
 # --- orchestrator ------------------------------------------------------------
 
 function _run_static_rules(ast, path::String, mod::Module)::Vector{CWDiagnostic}
-    const_like, non_const = _toplevel_names(ast)
+    const_like, non_const, non_const_lines = _toplevel_names(ast)
     out = CWDiagnostic[]
     for fd in _iter_function_defs(ast)
         append!(out, _rule_closure_arg(fd, path))
         append!(out, _rule_vararg(fd, path))
         append!(out, _rule_large_tuple(fd, path))
-        append!(out, _rule_untyped_global(fd, path, const_like, non_const, mod))
+        append!(out, _rule_untyped_global(fd, path, const_like, non_const, non_const_lines, mod))
         append!(out, _rule_kwargs(fd, path))
         append!(out, _rule_val(fd, path))
         append!(out, _rule_nested(fd, path))
@@ -1303,6 +1338,16 @@ end
 const _RULE_DYN_SPECIALIZATIONS = Symbol("dynamic-specializations-over")
 const _RULE_DYN_INFERENCE_TIME = Symbol("dynamic-inference-time-over")
 const _RULE_DYN_REINFER = Symbol("dynamic-reinfer-churn")
+const _RULE_DYN_COMPILE_TIME = Symbol("dynamic-compile-time-over")
+
+# `ci.time_compile` only carries a real (non-zero) codegen sample on the 1.12
+# `jl_set_newly_inferred` path -- `_process_legacy!`'s samples hardcode the
+# compile-time component to 0.0 (see `_walk_timings!`), since the 1.9-1.11
+# `Core.Compiler.Timings` tree has no per-CodeInstance codegen time field.
+# Gated on a load-time constant (rather than relying on that hardcoded 0.0
+# alone) so `dynamic-compile-time-over` is explicitly, unconditionally silent
+# on pre-1.12 Julia, per the design.
+const _DYNAMIC_HAS_COMPILE_TIME = @static VERSION >= v"1.12-" ? true : false
 
 function _set_dynamic_diag!(method::Method, rule_id::Symbol, file::String, line::Int,
                             message::String, suggestion::String, metric::Dict{String,Any})
@@ -1334,11 +1379,13 @@ function _refresh_dynamic_diagnostics!()
         end
         reinfer_count = sum((c - 1 for c in values(agg.mi_ci_counts) if c > 1); init=0)
         self_ms = agg.total_infer_self_s * 1000
+        compile_ms = agg.total_compile_s * 1000
+        total_compile_ms = self_ms + compile_ms   # inference self + codegen, per the design
 
         metric = Dict{String,Any}(
             "specializations"   => spec_count,
             "inference_self_ms" => round(self_ms; digits=3),
-            "compile_ms"        => round(agg.total_compile_s * 1000; digits=3),
+            "compile_ms"        => round(compile_ms; digits=3),
             "reinfer_count"     => reinfer_count,
         )
 
@@ -1357,6 +1404,12 @@ function _refresh_dynamic_diagnostics!()
                 "Method `$(method.name)` was re-inferred $(reinfer_count) times (over $(th.reinfer_count_over)) -- likely invalidation churn.",
                 "Avoid redefining dependencies of this method at runtime; check for non-const globals it depends on.",
                 metric)
+        elseif _DYNAMIC_HAS_COMPILE_TIME && total_compile_ms > th.compile_ms_over
+            _set_dynamic_diag!(method, _RULE_DYN_COMPILE_TIME, file, line,
+                "Method `$(method.name)` spent $(round(total_compile_ms; digits=1))ms total compiling (over $(th.compile_ms_over)ms).",
+                "Check for over-specialization or large signatures, or move this method to a lower tier.",
+                Dict{String,Any}("compile_ms" => round(total_compile_ms; digits=3),
+                                  "infer_ms" => round(self_ms; digits=3)))
         else
             lock(_session_lock) do
                 delete!(_dynamic_diagnostics, method)
@@ -1596,7 +1649,7 @@ function _reset!()
         empty!(_touched_methods)
     end
     _dirty[] = false
-    _thresholds[] = _Thresholds(32, 50.0, 3, 8, 1_000_000)
+    _thresholds[] = _Thresholds(32, 50.0, 3, 8, 1_000_000, 100.0)
     _disabled_rules[] = Set{Symbol}()
     return nothing
 end

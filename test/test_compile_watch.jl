@@ -70,6 +70,7 @@ _cw_reset!() = CW._reset!()
         @test tp[1].source === :static
         @test tp[1].method_name === :apply_cb
         @test tp[1].line == 2   # the `cb(x)` statement, not the def line
+        @test tp[1].fix == Dict("kind" => "nospecialize-arg", "symbol" => "cb")
 
         fp_nospec = compile_watch_check("""
         function apply_cb2(cb, x)
@@ -103,6 +104,7 @@ _cw_reset!() = CW._reset!()
         @test length(tp1) == 1
         @test tp1[1].rule_id === Symbol("vararg-unbounded-splat")
         @test tp1[1].line == 1
+        @test tp1[1].fix === nothing   # only closure-arg/int-float-acc/untyped-global attach a fix
 
         tp2 = compile_watch_check("""
         function va2(x::Vararg{Int})
@@ -155,6 +157,7 @@ _cw_reset!() = CW._reset!()
         @test tp[1].rule_id === Symbol("untyped-global-in-fn")
         @test tp[1].severity === :warning   # high-confidence: same-file non-const global
         @test tp[1].line == 3
+        @test tp[1].fix == Dict("kind" => "make-const", "symbol" => "cw_threshold", "def_line" => "1")
 
         fp_const = compile_watch_check("""
         const CW_THRESH = 5
@@ -190,6 +193,7 @@ _cw_reset!() = CW._reset!()
         """)
         @test length(hint) == 1
         @test hint[1].severity === :hint
+        @test hint[1].fix === nothing   # only the same-file non-const-global sub-case gets a fix
     end
 
     @testset "rule: keyword-heavy-signature" begin
@@ -329,6 +333,7 @@ _cw_reset!() = CW._reset!()
         @test hits_a[1].source === :static
         @test hits_a[1].line == 2   # reported at the init line, not the promotion site
         @test hits_a[1].metric === nothing
+        @test hits_a[1].fix == Dict("kind" => "float-init", "symbol" => "k3")
 
         # TP (b): plain assignment via division.
         tp_b1 = compile_watch_check("""
@@ -407,6 +412,29 @@ _cw_reset!() = CW._reset!()
     end
 
     # =====================================================================
+    # 3b. CWDiagnostic: the old (pre-`fix`) 9-arg constructor still works
+    # =====================================================================
+    @testset "CWDiagnostic old-arity constructor" begin
+        d = CWDiagnostic(Symbol("some-rule"), :warning, "some/path.jl", 7, :some_fn,
+                          "some message", "some suggestion", :static, nothing)
+        @test d.rule_id === Symbol("some-rule")
+        @test d.severity === :warning
+        @test d.file == "some/path.jl"
+        @test d.line == 7
+        @test d.method_name === :some_fn
+        @test d.message == "some message"
+        @test d.suggestion == "some suggestion"
+        @test d.source === :static
+        @test d.metric === nothing
+        @test d.fix === nothing   # defaults to no fix hint at the old arity
+
+        # A metric-carrying 9-arg call still defaults fix to nothing too.
+        d2 = CWDiagnostic(Symbol("some-rule"), :warning, "p.jl", 1, :f,
+                           "m", "s", :dynamic, Dict{String,Any}("x" => 1))
+        @test d2.fix === nothing
+    end
+
+    # =====================================================================
     # 4. Wire snapshot shape (design section 4 contract)
     # =====================================================================
     @testset "wire snapshot shape" begin
@@ -427,6 +455,7 @@ _cw_reset!() = CW._reset!()
         @test d["method"] == "cw_wire_fn"
         @test d["source"] == "static"
         @test haskey(d, "message") && haskey(d, "suggestion") && haskey(d, "metric")
+        @test d["fix"] == Dict("kind" => "nospecialize-arg", "symbol" => "cb")
 
         compile_watch_stop!()
         rm(tmpfile; force=true)
@@ -500,6 +529,62 @@ _cw_reset!() = CW._reset!()
         compile_watch_stop!()
         compile_watch_set_thresholds!(specializations_over=32, inference_self_ms_over=50.0,
                                       reinfer_count_over=3)
+        _cw_reset!()
+    end
+
+    @testset "rule: dynamic-compile-time-over" begin
+        _cw_reset!()
+        # Push every OTHER threshold far out of reach so only compile_ms_over
+        # can fire for this fixture, and push compile_ms_over to zero so any
+        # measured total compile time -- however small -- is deterministic,
+        # rather than depending on this machine's absolute speed.
+        compile_watch_set_thresholds!(specializations_over=1_000_000,
+            inference_self_ms_over=1_000_000.0, reinfer_count_over=1_000_000,
+            compile_ms_over=0.0)
+        result = compile_watch_start!(static=false, dynamic=true)
+
+        if result.dynamic_active
+            # Same fresh-module idiom as "dynamic layer: generates a real
+            # diagnostic" above (a previously-tiered module stops capturing new
+            # inferences on 1.12 -- see that test's comment). A generously
+            # sized body (hundreds of distinct statements) forces measurable
+            # inference + codegen time even on a fast machine.
+            m = Module(:CWSlowCompileTestMod)
+            tmpfile = joinpath(_cwtest_dir, "scripts", "_cw_slow_compile.jl")
+            body_lines = String["function cw_slow_compile_fn(a)"]
+            for i in 1:400
+                push!(body_lines, "    x$(i) = a + $(i) * 1 - $(i)")
+            end
+            push!(body_lines, "    return x400")
+            push!(body_lines, "end")
+            write(tmpfile, join(body_lines, "\n") * "\n")
+            Base.include(m, tmpfile)   # a real, file-backed definition (method.file resolves)
+            Base.invokelatest(Base.invokelatest(getfield, m, :cw_slow_compile_fn), 1)
+
+            diags = compile_watch_report()
+            dyn = filter(d -> d.rule_id === Symbol("dynamic-compile-time-over") &&
+                              d.method_name === :cw_slow_compile_fn, diags)
+            @test !isempty(dyn)
+            if !isempty(dyn)
+                d = dyn[1]
+                @test d.severity === :warning
+                @test d.source === :dynamic
+                @test d.file == abspath(tmpfile)
+                @test d.line == 1
+                @test d.metric !== nothing
+                @test haskey(d.metric, "compile_ms")
+                @test haskey(d.metric, "infer_ms")
+                @test d.metric["compile_ms"] > 0
+                @test d.fix === nothing   # dynamic-compile-time-over never attaches a fix hint
+            end
+            rm(tmpfile; force=true)
+        else
+            @info "CompileWatch: dynamic capability unavailable in this test run -- dynamic-compile-time-over not exercised" VERSION
+        end
+
+        compile_watch_stop!()
+        compile_watch_set_thresholds!(specializations_over=32, inference_self_ms_over=50.0,
+                                      reinfer_count_over=3, compile_ms_over=100.0)
         _cw_reset!()
     end
 
