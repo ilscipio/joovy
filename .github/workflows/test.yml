@@ -8,6 +8,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # Every supported Julia must report. Without this, the first leg to
+      # fail cancels the rest, so a version-specific break looks like one
+      # failure when it may be four -- and legs that would still pass go
+      # unverified.
+      fail-fast: false
       matrix:
         julia-version: ['1.9', '1.10', '1.11', '1.12']
     steps:

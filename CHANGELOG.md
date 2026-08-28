@@ -3,6 +3,31 @@
 All notable changes to Joovy are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Fixed
+
+- `dynamic-specializations-over` never fired on Julia 1.9: the specialization
+  count went through `Base.specializations`, which only exists from 1.10 on,
+  and the surrounding `catch` turned the resulting error into a count of 0.
+  The rule stayed silent and `dynamic-inference-time-over` reported in its
+  place. On 1.9 the count now reads the `Method.specializations` field
+  directly.
+- The `dynamic-compile-time-over` test asserted a diagnostic whenever the
+  dynamic layer was active. The 1.9-1.11 legacy capture layer does activate,
+  but carries no per-CodeInstance codegen time, so the rule is silent there by
+  design. The test now branches on `_DYNAMIC_HAS_COMPILE_TIME` and asserts
+  that documented silence on older Julia instead of skipping it.
+
+### Changed
+
+- CI runs the Julia matrix with `fail-fast: false`. The 1.9 failure above
+  cancelled the 1.10, 1.11 and 1.12 legs, so three of four versions went
+  unverified on every red run.
+- New `test/run_matrix.jl` runs the suite against every Julia version in the
+  CI matrix locally, each in its own copy of the tracked files. It reads the
+  version list from the workflow file, so the two matrices cannot drift.
+
 ## [0.4.1] - 2026-08-14
 
 ### Added

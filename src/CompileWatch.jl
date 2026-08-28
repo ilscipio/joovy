@@ -1335,6 +1335,23 @@ end
 
 # --- aggregation -> diagnostics ----------------------------------------------
 
+# `Base.specializations` only exists from Julia 1.10 on. On 1.9 -- still in
+# this package's [compat] range -- read the `Method` field directly: it holds
+# either a bare `MethodInstance` (exactly one specialization) or a
+# `Core.SimpleVector` used as a hash table, whose empty slots are `nothing`.
+# Without this fallback the 1.9 count silently degrades to 0, so
+# `dynamic-specializations-over` never fires there and a lower-priority rule
+# reports in its place.
+@static if isdefined(Base, :specializations)
+    _specialization_count(m::Method) = length(collect(Base.specializations(m)))
+else
+    function _specialization_count(m::Method)
+        s = m.specializations
+        s isa Core.MethodInstance && return 1
+        return count(x -> x !== nothing, s)
+    end
+end
+
 const _RULE_DYN_SPECIALIZATIONS = Symbol("dynamic-specializations-over")
 const _RULE_DYN_INFERENCE_TIME = Symbol("dynamic-inference-time-over")
 const _RULE_DYN_REINFER = Symbol("dynamic-reinfer-churn")
@@ -1373,7 +1390,7 @@ function _refresh_dynamic_diagnostics!()
         file === nothing && continue
 
         spec_count = try
-            length(collect(Base.specializations(method)))
+            _specialization_count(method)
         catch
             0
         end

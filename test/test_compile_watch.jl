@@ -520,6 +520,11 @@ _cw_reset!() = CW._reset!()
                 @test d.line == 1
                 @test d.metric !== nothing
                 @test haskey(d.metric, "specializations")
+                # A called method always has at least one specialization. Assert
+                # the real count, not just the key: `Base.specializations` is
+                # absent on Julia 1.9, and the fallback silently reporting 0
+                # there is what let a lower-priority rule win this test before.
+                @test d.metric["specializations"] > 0
             end
             rm(tmpfile; force=true)
         else
@@ -564,18 +569,30 @@ _cw_reset!() = CW._reset!()
             diags = compile_watch_report()
             dyn = filter(d -> d.rule_id === Symbol("dynamic-compile-time-over") &&
                               d.method_name === :cw_slow_compile_fn, diags)
-            @test !isempty(dyn)
-            if !isempty(dyn)
-                d = dyn[1]
-                @test d.severity === :warning
-                @test d.source === :dynamic
-                @test d.file == abspath(tmpfile)
-                @test d.line == 1
-                @test d.metric !== nothing
-                @test haskey(d.metric, "compile_ms")
-                @test haskey(d.metric, "infer_ms")
-                @test d.metric["compile_ms"] > 0
-                @test d.fix === nothing   # dynamic-compile-time-over never attaches a fix hint
+            # Julia < 1.12 has no per-CodeInstance codegen time, so this rule
+            # is unconditionally silent there by design -- see
+            # `_DYNAMIC_HAS_COMPILE_TIME` in CompileWatch.jl. Key the branch on
+            # that constant, not on `dynamic_active`: the 1.9-1.11 legacy
+            # capture layer DOES activate, it just carries no compile time.
+            if CW._DYNAMIC_HAS_COMPILE_TIME
+                @test !isempty(dyn)
+                if !isempty(dyn)
+                    d = dyn[1]
+                    @test d.severity === :warning
+                    @test d.source === :dynamic
+                    @test d.file == abspath(tmpfile)
+                    @test d.line == 1
+                    @test d.metric !== nothing
+                    @test haskey(d.metric, "compile_ms")
+                    @test haskey(d.metric, "infer_ms")
+                    @test d.metric["compile_ms"] > 0
+                    @test d.fix === nothing   # dynamic-compile-time-over never attaches a fix hint
+                end
+            else
+                # Assert the documented silence rather than skipping, so a
+                # future change that starts emitting this rule pre-1.12 is
+                # caught here instead of passing unnoticed.
+                @test isempty(dyn)
             end
             rm(tmpfile; force=true)
         else
